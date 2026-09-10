@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -57,11 +58,17 @@ type clientTestHarness struct {
 // localhost UDP, with one peer whose allow map is the given service to
 // backend address mapping, and publishes that peer's key material under the
 // environment variables the client's references name.
-func clientTestStart(t *testing.T, allow map[string]string) *clientTestHarness {
+func clientTestStart(t *testing.T, allow map[string]string, tweaks ...func(*serverTestPeer)) *clientTestHarness {
 	t.Helper()
 
 	peer := serverTestNewPeer(t, "app", "10.99.0.7")
 	peer.Allow = allow
+	// Applied before the server starts, so the peers file the watcher
+	// loads is already the one the test wants: rewriting it afterwards
+	// races the watch being armed inside Run.
+	for _, f := range tweaks {
+		f(peer)
+	}
 	h := serverTestStart(t, peer)
 
 	t.Setenv(strings.TrimPrefix(string(clientTestPrivRef), "env:"), deviceTestB64(peer.Priv))
@@ -341,6 +348,44 @@ func clientTestAssertHandshakeTimeout(t *testing.T, c *Client, service string) {
 		}
 	case <-time.After(clientTestFailBudget + 30*time.Second):
 		t.Fatal("Dial did not return; it must be bounded by DialTimeout, never open ended")
+	}
+}
+
+// TestClientWrongKeyAndWrongPSKAreIndistinguishable is the security claim
+// the client exists to uphold, pinned as an assertion rather than left to
+// hold by accident. Spec section 8.1: the library must not distinguish a
+// wrong key from a wrong PSK from a dead endpoint, because any
+// distinguishing signal is what a scanner is looking for. Structurally
+// there is one path today, so a future change adding a PSK specific detail
+// would fail neither of the two tests above; it fails this one.
+func TestClientWrongKeyAndWrongPSKAreIndistinguishable(t *testing.T) {
+	backend := serverTestNewBackend(t, serverTestEcho)
+	h := clientTestStart(t, map[string]string{"echo": backend.String()})
+
+	_, wrongPub := deviceTestKeypair(t)
+	wrongKey := h.client(func(cfg *ClientConfig) {
+		cfg.ServerPubKey = wrongPub
+		cfg.DialTimeout = clientTestFailBudget
+	})
+
+	t.Setenv("GOCLOAK_TEST_CLIENT_OTHER_PSK", deviceTestB64(deviceTestPSK(t)))
+	wrongPSK := h.client(func(cfg *ClientConfig) {
+		cfg.PresharedKey = "env:GOCLOAK_TEST_CLIENT_OTHER_PSK"
+		cfg.DialTimeout = clientTestFailBudget
+	})
+
+	ctx := clientTestCtx(t, 60*time.Second)
+
+	_, keyErr := wrongKey.Dial(ctx, "echo")
+	_, pskErr := wrongPSK.Dial(ctx, "echo")
+	if keyErr == nil || pskErr == nil {
+		t.Fatalf("want both dials to fail, got key=%v psk=%v", keyErr, pskErr)
+	}
+
+	// The duration is the one part that legitimately differs, and it is
+	// rounded to 100ms in the message, so both land on the same budget.
+	if keyErr.Error() != pskErr.Error() {
+		t.Errorf("a wrong server key and a wrong PSK produce different errors, which is the signal spec 8.1 forbids:\n  wrong key: %s\n  wrong psk: %s", keyErr, pskErr)
 	}
 }
 
@@ -630,6 +675,218 @@ func TestClientBrokenConnectionErrorsAndIsNotReconnected(t *testing.T) {
 		t.Fatalf("Dial after the first conn broke: %v", err)
 	}
 	conn2.Close()
+}
+
+// TestClientHelloIsBoundedByTheDialBudget asserts DialTimeout bounds what
+// its documentation says it bounds. It used to bound only the tunnel
+// handshake, so a server that accepted the connection and then stalled
+// could hold a caller for two further HelloReadDeadlines beyond the budget
+// it asked for.
+func TestClientHelloIsBoundedByTheDialBudget(t *testing.T) {
+	const budget = 200 * time.Millisecond
+
+	// The deadline for one step of the exchange is the sooner of the
+	// spec's value and what is left of the budget.
+	c := &Client{endpointText: "127.0.0.1:51820", dialTimeout: budget}
+
+	tight, cancelTight := context.WithTimeout(context.Background(), budget)
+	defer cancelTight()
+	if d := c.helloDeadline(tight); d.After(time.Now().Add(budget + time.Second)) {
+		t.Errorf("helloDeadline is %v away on a %v budget; it must not exceed the budget", time.Until(d), budget)
+	}
+
+	loose, cancelLoose := context.WithTimeout(context.Background(), time.Hour)
+	defer cancelLoose()
+	if d := c.helloDeadline(loose); d.After(time.Now().Add(HelloReadDeadline)) {
+		t.Errorf("helloDeadline is %v away on an hour long budget; it must not exceed HelloReadDeadline", time.Until(d))
+	}
+	if d := c.helloDeadline(loose); d.Before(time.Now().Add(HelloReadDeadline - time.Second)) {
+		t.Errorf("helloDeadline is only %v away on an hour long budget; it should be HelloReadDeadline", time.Until(d))
+	}
+
+	// End to end over a pipe: a far end that takes the request and then
+	// says nothing at all.
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	go io.ReadFull(remote, make([]byte, 2+len("svc")))
+
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	start := time.Now()
+	err := c.hello(ctx, local, "svc")
+	took := time.Since(start)
+
+	if err == nil {
+		t.Fatal("hello returned nil against a far end that never answered")
+	}
+	if took > time.Second {
+		t.Errorf("hello took %v against a %v budget; DialTimeout must bound the hello exchange, not just the handshake", took, budget)
+	}
+}
+
+// TestClientFinishHelloRefusesAConnTheWatchdogIsClosing exercises the
+// use-after-return branch directly, because the real window is
+// sub-microsecond and no timing test can hit it reliably.
+//
+// context.AfterFunc's stop reports false when the watchdog has already
+// started, which means conn.Close is running in another goroutine. A
+// connection in that state must never be returned to the caller: it would
+// be a fully established, hello-completed conn that dies underneath the
+// application with no error at all.
+func TestClientFinishHelloRefusesAConnTheWatchdogIsClosing(t *testing.T) {
+	c := &Client{endpointText: "127.0.0.1:51820", dialTimeout: time.Second}
+
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// stop reports false: the watchdog already fired.
+	err := c.finishHello(cancelled, local, func() bool { return false })
+	if err == nil {
+		t.Fatal("finishHello returned nil when the watchdog had already started; the caller would receive a conn that is being torn down")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("finishHello returned %v, want it to carry the context error", err)
+	}
+
+	// stop reports true: the watchdog was unregistered in time, so the
+	// conn is safe to hand over and its deadlines are cleared.
+	if err := local.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	stopped := false
+	if err := c.finishHello(context.Background(), local, func() bool { stopped = true; return true }); err != nil {
+		t.Fatalf("finishHello with a stopped watchdog: %v", err)
+	}
+	if !stopped {
+		t.Error("finishHello did not call stop; the watchdog would outlive the exchange")
+	}
+
+	// The deadline is cleared, so a read blocks rather than expiring.
+	// One byte written from the far end proves the conn is live.
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := local.Read(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("read returned %v immediately; the deadline was not cleared", err)
+	case <-time.After(1500 * time.Millisecond):
+		// Still blocked well past the old one second deadline.
+	}
+	if _, err := remote.Write([]byte("x")); err != nil {
+		t.Fatalf("write from the far end: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("read after the deadline was cleared: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("read did not return after the far end wrote")
+	}
+}
+
+// TestClientDialUnderRepeatedCancellationNeverReturnsADeadConn is the other
+// half of the same finding, from the outside: hammer Dial with contexts
+// cancelled at randomized offsets around the moment a dial completes, and
+// require that every conn Dial returned is actually usable. A connection
+// torn down by the watchdog after being returned fails the exchange below.
+//
+// Two different things are being asserted, with two different strengths.
+// Cancelling the context immediately after a successful Dial is
+// DETERMINISTIC, and it catches a watchdog left armed past the exchange:
+// that connection is closed underneath the byte exchange below and the test
+// fails every time. The randomized timer is only a sweep: the real
+// use-after-return window is sub-microsecond, so landing in it is luck, and
+// this test is not proof that it is closed. The direct proof is
+// TestClientFinishHelloRefusesAConnTheWatchdogIsClosing.
+func TestClientDialUnderRepeatedCancellationNeverReturnsADeadConn(t *testing.T) {
+	backend := serverTestNewBackend(t, serverTestEcho)
+	// The default rate cap is 10 dials per second, which this test would
+	// spend its whole budget waiting on.
+	h := clientTestStart(t, map[string]string{"echo": backend.String()}, func(p *serverTestPeer) {
+		p.Limits = PeerLimits{MaxConcurrent: 64, DialsPerSecond: 5000}
+	})
+
+	c := h.client()
+
+	// The first dial pays for the WireGuard handshake, so it is not
+	// representative. Measure the second, once the tunnel is up: that is
+	// the duration the cancellations below have to land inside for the
+	// exchange to be completing as the watchdog fires.
+	warm := clientTestCtx(t, clientTestDialBudget+10*time.Second)
+	conn, err := c.Dial(warm, "echo")
+	if err != nil {
+		t.Fatalf("warm up Dial: %v", err)
+	}
+	conn.Close()
+
+	start := time.Now()
+	conn, err = c.Dial(warm, "echo")
+	if err != nil {
+		t.Fatalf("second warm up Dial: %v", err)
+	}
+	conn.Close()
+	typical := time.Since(start)
+	if typical < time.Millisecond {
+		typical = time.Millisecond
+	}
+	t.Logf("a warm dial takes about %v; cancelling within 0 to %v", typical, 2*typical)
+
+	deadline := time.Now().Add(10 * time.Second)
+	var returned, usable int
+	for i := 0; i < 300 && time.Now().Before(deadline); i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		delay := time.Duration(rand.Int64N(int64(2 * typical)))
+		timer := time.AfterFunc(delay, cancel)
+
+		conn, err := c.Dial(ctx, "echo")
+		if err != nil {
+			timer.Stop()
+			cancel()
+			continue
+		}
+		returned++
+
+		// The dial's context is finished the moment Dial returns, so
+		// cancel it now, before a single application byte moves. A
+		// watchdog left armed past the exchange, or one whose stop
+		// result went unchecked, tears the connection down here.
+		timer.Stop()
+		cancel()
+
+		// The conn was handed over, so it must work, cancelled ctx or
+		// not: Dial's context governs the dial, never the lifetime of
+		// a connection it returned.
+		if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			t.Fatalf("iteration %d: set deadline on a returned conn: %v", i, err)
+		}
+		if _, werr := conn.Write([]byte("ping")); werr != nil {
+			t.Fatalf("iteration %d: write on a conn Dial returned: %v", i, werr)
+		}
+		got := make([]byte, 4)
+		if _, rerr := io.ReadFull(conn, got); rerr != nil {
+			t.Fatalf("iteration %d: read on a conn Dial returned: %v", i, rerr)
+		}
+		if string(got) != "ping" {
+			t.Fatalf("iteration %d: read %q, want %q", i, got, "ping")
+		}
+		usable++
+		conn.Close()
+	}
+
+	t.Logf("%d of %d returned conns were usable", usable, returned)
+	if returned < 4 {
+		t.Fatalf("only %d dials returned a conn; the test would pass vacuously", returned)
+	}
 }
 
 // ---------------------------------------------------------------------------

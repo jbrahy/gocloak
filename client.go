@@ -276,8 +276,12 @@ func clientDeviceLogf(format string, args ...any) {
 //
 // It blocks until the WireGuard handshake completes, so the first call
 // surfaces an authentication failure rather than handing back a connection
-// that hangs. The wait is bounded by ClientConfig.DialTimeout and by ctx,
-// whichever expires first; on expiry it returns ErrHandshakeTimeout.
+// that hangs. The whole call, the handshake and the hello exchange both, is
+// bounded by ClientConfig.DialTimeout and by ctx, whichever expires first.
+// A budget spent waiting on the handshake returns ErrHandshakeTimeout; a
+// budget spent after the tunnel came up returns the context's own error,
+// because at that point the handshake demonstrably succeeded and spec
+// section 8.1 does not apply.
 //
 // The returned net.Conn is a plain byte pipe to the backend, and it is
 // never re-established underneath the caller. Spec section 8.2: a tunnel
@@ -302,51 +306,109 @@ func (c *Client) Dial(ctx context.Context, service string) (net.Conn, error) {
 		return nil, ErrClientClosed
 	}
 
-	conn, err := c.dialControl(ctx)
+	// One budget for the whole call, not one for the tunnel and another
+	// for the hello exchange. context.WithTimeout keeps a parent's
+	// earlier deadline, so "DialTimeout or the caller's ctx, whichever
+	// is sooner" needs no comparison here.
+	budget, cancel := context.WithTimeout(ctx, c.dialTimeout)
+	defer cancel()
+
+	conn, err := c.dialControl(ctx, budget)
 	if err != nil {
 		return nil, err
 	}
-	ok := false
+	if err := c.hello(budget, conn, service); err != nil {
+		// Every failure of the exchange closes the connection here,
+		// including the one where the watchdog is already closing it:
+		// Close is idempotent, and a connection that is not returned
+		// is never left open.
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// hello performs the hello exchange from spec section 4 on an established
+// in-tunnel connection: write the service name, read the status, and clear
+// the deadlines so the connection becomes a raw pipe.
+//
+// On any error the connection must be closed by the caller. On success the
+// connection is safe to hand to the application: see finishHello for what
+// "safe" has to mean here.
+func (c *Client) hello(ctx context.Context, conn net.Conn, service string) error {
+	// A watchdog, so a ctx that fires during the exchange ends it
+	// promptly rather than at the deadline below.
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stopCalled := false
 	defer func() {
-		if !ok {
-			conn.Close()
+		// Every path calls stop exactly once: this defer on the
+		// error paths, finishHello on the success path.
+		if !stopCalled {
+			stop()
 		}
 	}()
 
-	// The hello exchange has its own deadline, and a watchdog so a
-	// cancelled ctx ends it promptly rather than at the deadline.
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	defer stop()
-
-	if err := conn.SetWriteDeadline(time.Now().Add(HelloReadDeadline)); err != nil {
-		return nil, fmt.Errorf("gocloak: client: %w", err)
+	if err := conn.SetWriteDeadline(c.helloDeadline(ctx)); err != nil {
+		return fmt.Errorf("gocloak: client: %w", err)
 	}
 	if err := WriteHelloRequest(conn, service); err != nil {
-		return nil, c.helloError(ctx, err)
+		return c.helloError(ctx, err)
 	}
 	// The response read gets its own deadline, so a server that accepted
 	// the request and then went quiet is bounded by the spec's value
 	// rather than by whatever was left of the write's budget.
-	if err := conn.SetReadDeadline(time.Now().Add(HelloReadDeadline)); err != nil {
-		return nil, fmt.Errorf("gocloak: client: %w", err)
+	if err := conn.SetReadDeadline(c.helloDeadline(ctx)); err != nil {
+		return fmt.Errorf("gocloak: client: %w", err)
 	}
 	status, err := ReadHelloResponse(conn)
 	if err != nil {
-		return nil, c.helloError(ctx, err)
+		return c.helloError(ctx, err)
 	}
 	if err := statusError(status, service); err != nil {
-		return nil, err
+		return err
 	}
 
+	stopCalled = true
+	return c.finishHello(ctx, conn, stop)
+}
+
+// finishHello unregisters the watchdog and prepares a connection to be
+// handed to the application.
+//
+// The result of stop is load bearing. Per the context package's contract,
+// stop reports false when the watchdog has ALREADY STARTED, which here
+// means conn.Close is running, or about to run, in another goroutine. In
+// that case the connection is being torn down and must not be returned:
+// doing so would hand the caller an established, hello-completed connection
+// that dies underneath it with no error, which surfaces in production only
+// as an unexplained reset. The window is sub-microsecond, which is exactly
+// why it has to be handled here rather than found in a test.
+//
+// It is a separate function so that branch can be exercised directly.
+func (c *Client) finishHello(ctx context.Context, conn net.Conn, stop func() bool) error {
+	if !stop() {
+		return c.helloError(ctx, ctx.Err())
+	}
 	// Spec section 4: deadlines are cleared after the response. From
 	// here the connection is a raw pipe, and a long idle session is
 	// legitimate.
 	if err := conn.SetDeadline(time.Time{}); err != nil {
-		return nil, fmt.Errorf("gocloak: client: %w", err)
+		return fmt.Errorf("gocloak: client: %w", err)
 	}
+	return nil
+}
 
-	ok = true
-	return conn, nil
+// helloDeadline is the deadline for one step of the hello exchange: the
+// spec's value, or the remaining budget when that is sooner. Without the
+// second half, DialTimeout would bound only the tunnel handshake and a
+// server that accepted the connection and then stalled could hold a caller
+// for HelloReadDeadline beyond the budget it asked for, twice over.
+func (c *Client) helloDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(HelloReadDeadline)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		return d
+	}
+	return deadline
 }
 
 // DialContext exists so a *Client drops into http.Transport.DialContext and
@@ -376,19 +438,15 @@ func (c *Client) Close() error {
 //
 // Retrying is what makes Dial block on the handshake: until the tunnel is
 // up, the SYN is dropped and no connection can be made, and once it is up
-// the first attempt succeeds. The loop is bounded by the caller's context
-// and by DialTimeout, whichever is sooner, so a handshake that never
-// completes fails rather than hangs.
-func (c *Client) dialControl(ctx context.Context) (net.Conn, error) {
+// the first attempt succeeds. budget is the whole call's bound, already the
+// sooner of DialTimeout and the caller's ctx, so a handshake that never
+// completes fails rather than hangs. ctx is the caller's own, used only to
+// tell a cancellation apart from an expiry.
+func (c *Client) dialControl(ctx, budget context.Context) (net.Conn, error) {
 	start := time.Now()
 
-	// context.WithTimeout keeps the parent's earlier deadline, so this
-	// is "whichever is sooner" without comparing anything.
-	dialCtx, cancel := context.WithTimeout(ctx, c.dialTimeout)
-	defer cancel()
-
 	for {
-		attemptCtx, attemptCancel := context.WithTimeout(dialCtx, clientDialAttemptTimeout)
+		attemptCtx, attemptCancel := context.WithTimeout(budget, clientDialAttemptTimeout)
 		conn, err := c.dev.Net().DialContextTCPAddrPort(attemptCtx, c.serverAddr)
 		attemptCancel()
 		if err == nil {
@@ -396,16 +454,34 @@ func (c *Client) dialControl(ctx context.Context) (net.Conn, error) {
 		}
 
 		select {
-		case <-dialCtx.Done():
+		case <-budget.Done():
 			// A caller who cancelled gets their own error back:
 			// nothing timed out, they changed their mind.
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return nil, fmt.Errorf("gocloak: client: dial %s: %w", c.endpointText, ctx.Err())
 			}
-			return nil, c.handshakeTimeoutError(time.Since(start))
+			return nil, c.handshakeTimeoutError(handshakeBound(budget, start))
 		case <-time.After(clientDialRetryInterval):
 		}
 	}
+}
+
+// handshakeBound is how long the client was prepared to wait: the budget's
+// deadline, not the elapsed time it took to give up.
+//
+// Reporting the bound is what spec section 8.1's "after <d>" names, and it
+// keeps the message byte for byte identical whatever the cause was. A
+// measured elapsed time varies a little with the failure, and a message
+// that varies with the failure is the beginning of exactly the
+// distinguishing signal section 8.1 exists to deny.
+//
+// budget always carries a deadline, since Dial builds it with
+// context.WithTimeout. The fallback is for a caller that is not Dial.
+func handshakeBound(budget context.Context, start time.Time) time.Duration {
+	if deadline, ok := budget.Deadline(); ok {
+		return deadline.Sub(start).Round(time.Millisecond)
+	}
+	return time.Since(start).Round(100 * time.Millisecond)
 }
 
 // handshakeTimeoutError is the message spec section 8.1 fixes. Every
@@ -419,7 +495,7 @@ func (c *Client) handshakeTimeoutError(waited time.Duration) error {
 		"wrong server public key, wrong client key, revoked peer, wrong PSK, "+
 		"UDP blocked on this network, or the endpoint is down. "+
 		"The server cannot tell you which. Check the server log for a peer entry.",
-		ErrHandshakeTimeout, c.endpointText, waited.Round(100*time.Millisecond))
+		ErrHandshakeTimeout, c.endpointText, waited)
 }
 
 // helloError wraps a failure during the hello exchange. A cancelled or
