@@ -216,6 +216,25 @@ func TestPolicy_NewRejects(t *testing.T) {
 			},
 		},
 		{
+			name: "unspecified backend address: 0.0.0.0",
+			peers: []PeerPolicy{
+				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": mustAddrPort("0.0.0.0:3306")}},
+			},
+		},
+		{
+			name: "unspecified backend address: [::]",
+			peers: []PeerPolicy{
+				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": mustAddrPort("[::]:3306")}},
+			},
+		},
+		{
+			name: "duplicate tunnel ip: IPv4 and its IPv4-in-IPv6 spelling",
+			peers: []PeerPolicy{
+				{TunnelIP: mustAddr("10.99.0.7"), Allow: map[string]netip.AddrPort{"a": validBackend}},
+				{TunnelIP: mustAddr("::ffff:10.99.0.7"), Allow: map[string]netip.AddrPort{"b": validBackend}},
+			},
+		},
+		{
 			name: "one bad peer among good peers still fails the whole construction",
 			peers: []PeerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": validBackend}},
@@ -265,6 +284,38 @@ func TestPolicy_NewEmpty(t *testing.T) {
 	}
 	if _, ok := pol.Resolve(mustAddr("10.99.0.2"), "primary-db"); ok {
 		t.Fatalf("Resolve against empty policy must deny, got allow")
+	}
+}
+
+// TestPolicyResolve_UnmapsIPv4InIPv6 asserts that a policy built with an
+// IPv4 tunnel IP resolves correctly when queried with the equivalent
+// IPv4-in-IPv6 spelling, and vice versa for a policy built with the mapped
+// form. This matters because task 7 derives the lookup key from
+// conn.RemoteAddr(), which may yield either spelling; without normalization
+// a mismatch would silently deny every lookup for that peer.
+func TestPolicyResolve_UnmapsIPv4InIPv6(t *testing.T) {
+	backend := mustAddrPort("192.0.2.10:3306")
+
+	polV4, err := NewPolicy([]PeerPolicy{
+		{TunnelIP: mustAddr("10.99.0.7"), Allow: map[string]netip.AddrPort{"primary-db": backend}},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy: unexpected error: %v", err)
+	}
+	got, ok := polV4.Resolve(mustAddr("::ffff:10.99.0.7"), "primary-db")
+	if !ok || got != backend {
+		t.Fatalf("Resolve(mapped form of a policy built with plain IPv4) = %v, %v; want %v, true", got, ok, backend)
+	}
+
+	polMapped, err := NewPolicy([]PeerPolicy{
+		{TunnelIP: mustAddr("::ffff:10.99.0.7"), Allow: map[string]netip.AddrPort{"primary-db": backend}},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy: unexpected error: %v", err)
+	}
+	got, ok = polMapped.Resolve(mustAddr("10.99.0.7"), "primary-db")
+	if !ok || got != backend {
+		t.Fatalf("Resolve(plain IPv4 of a policy built with mapped form) = %v, %v; want %v, true", got, ok, backend)
 	}
 }
 

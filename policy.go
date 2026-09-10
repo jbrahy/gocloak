@@ -51,24 +51,29 @@ func NewPolicy(peers []PeerPolicy) (*Policy, error) {
 		if !p.TunnelIP.IsValid() {
 			return nil, errors.New("gocloak: policy: peer has an invalid tunnel ip")
 		}
-		if p.TunnelIP.IsUnspecified() {
-			return nil, fmt.Errorf("gocloak: policy: peer %s: unspecified tunnel ip is not allowed", p.TunnelIP)
+		// Unmap before the unspecified and duplicate checks so
+		// 10.99.0.7 and its IPv4-in-IPv6 spelling ::ffff:10.99.0.7 are
+		// recognized as the same identity, both here and in Resolve
+		// below.
+		tunnelIP := p.TunnelIP.Unmap()
+		if tunnelIP.IsUnspecified() {
+			return nil, fmt.Errorf("gocloak: policy: peer %s: unspecified tunnel ip is not allowed", tunnelIP)
 		}
-		if _, dup := m[p.TunnelIP]; dup {
-			return nil, fmt.Errorf("gocloak: policy: duplicate tunnel ip %s", p.TunnelIP)
+		if _, dup := m[tunnelIP]; dup {
+			return nil, fmt.Errorf("gocloak: policy: duplicate tunnel ip %s", tunnelIP)
 		}
 
 		allow := make(map[string]netip.AddrPort, len(p.Allow))
 		for name, backend := range p.Allow {
 			if !ValidServiceName(name) {
-				return nil, fmt.Errorf("gocloak: policy: peer %s: invalid service name", p.TunnelIP)
+				return nil, fmt.Errorf("gocloak: policy: peer %s: invalid service name", tunnelIP)
 			}
-			if !backend.IsValid() || backend.Port() == 0 {
-				return nil, fmt.Errorf("gocloak: policy: peer %s: service %s: invalid backend address", p.TunnelIP, name)
+			if !backend.IsValid() || backend.Port() == 0 || backend.Addr().IsUnspecified() {
+				return nil, fmt.Errorf("gocloak: policy: peer %s: service %s: invalid backend address", tunnelIP, name)
 			}
 			allow[name] = backend
 		}
-		m[p.TunnelIP] = allow
+		m[tunnelIP] = allow
 	}
 
 	return &Policy{peers: m}, nil
@@ -81,7 +86,10 @@ func NewPolicy(peers []PeerPolicy) (*Policy, error) {
 // (netip.AddrPort{}, false). Callers must check the bool; the zero
 // netip.AddrPort is never a valid grant.
 func (p *Policy) Resolve(peerTunnelIP netip.Addr, serviceName string) (netip.AddrPort, bool) {
-	allow, ok := p.peers[peerTunnelIP]
+	// Unmap so an IPv4-in-IPv6 spelling of a tunnel IP (as conn.RemoteAddr
+	// may yield) resolves identically to its IPv4 form, matching how
+	// NewPolicy normalizes keys at construction.
+	allow, ok := p.peers[peerTunnelIP.Unmap()]
 	if !ok {
 		return netip.AddrPort{}, false
 	}
