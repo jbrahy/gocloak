@@ -141,8 +141,21 @@ The tests that prove the threat model. Each is a real test in
 `security_test.go`.
 
 1. Wrong client key: the handshake never completes, and a capture on the
-   server's UDP socket shows zero bytes sent back.
-2. Correct key, wrong PSK: same, zero bytes back.
+   server's UDP socket shows zero bytes sent back. The server decrypts the
+   initiation, finds no peer with that static public key, and drops it
+   silently.
+2. Correct key, wrong PSK: no session is established and zero transport data
+   packets flow in either direction.
+
+   Note, corrected during implementation: this case CANNOT show zero bytes
+   back, and an earlier version of this document wrongly said it could. Noise
+   IKpsk2 mixes the PSK into message 2, not message 1, so the server accepts
+   the initiation, finds the peer, and answers with a handshake response
+   before the PSK is ever consulted. The client then fails to derive matching
+   keys and no session forms. Spec section 7.2 item 2 already states the
+   governing property: silent to strangers, but anyone already holding the
+   server public key can confirm the endpoint exists. Assert the absence of a
+   session, not the absence of bytes.
 3. Revoke a connected peer via hot reload, then assert the next `Dial` fails.
 4. Peer A dialing peer B's service is denied with status `0x01`.
 5. A captured handshake initiation, replayed, is rejected.
