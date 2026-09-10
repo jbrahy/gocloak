@@ -432,10 +432,10 @@ func TestConfigHotReloadHappyPath(t *testing.T) {
 			}
 		}
 	})
-	if names := PeerNames(got.Diff.Added); len(names) != 1 || names[0] != "app-02" {
+	if names := peerNames(got.Diff.Added); len(names) != 1 || names[0] != "app-02" {
 		t.Errorf("Diff.Added names = %v, want [app-02]", names)
 	}
-	if names := PeerNames(got.Diff.Removed); len(names) != 1 || names[0] != "app-01" {
+	if names := peerNames(got.Diff.Removed); len(names) != 1 || names[0] != "app-01" {
 		t.Errorf("Diff.Removed names = %v, want [app-01]", names)
 	}
 }
@@ -692,5 +692,67 @@ func TestConfigSecretRefNotEchoedInError(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), literal) {
 		t.Errorf("error echoes the psk value: %v", err)
+	}
+}
+
+func TestConfigYAMLTypeErrorRedactsValue(t *testing.T) {
+	// yaml.v3's type-mismatch errors embed the first seven characters of
+	// the offending scalar. A key pasted into an int field must not put a
+	// prefix of that key into an error, and from there into a log line.
+	const secret = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY123456"
+
+	containsAnyPrefix := func(msg string) string {
+		for n := 3; n <= len(secret); n++ {
+			if strings.Contains(msg, secret[:n]) {
+				return secret[:n]
+			}
+		}
+		return ""
+	}
+
+	cases := map[string]string{
+		"peers limits.max_concurrent": fmt.Sprintf(`peers:
+  - name: app-01
+    public_key: %s
+    psk: env:PSK
+    tunnel_ip: 10.99.0.7
+    limits:
+      max_concurrent: %s
+    allow: {}
+`, testKey(1), secret),
+		"peers limits.dials_per_second": fmt.Sprintf(`peers:
+  - name: app-01
+    public_key: %s
+    psk: env:PSK
+    tunnel_ip: 10.99.0.7
+    limits:
+      dials_per_second: %s
+    allow: {}
+`, testKey(1), secret),
+		"whole file pasted where peers belong": secret + "\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadPeersConfig(tempFile(t, "peers.yaml", yaml))
+			if err == nil {
+				t.Fatal("want error, got nil")
+			}
+			if leaked := containsAnyPrefix(err.Error()); leaked != "" {
+				t.Errorf("error leaks the value prefix %q: %v", leaked, err)
+			}
+		})
+	}
+
+	for _, field := range []string{"mtu", "listen_port"} {
+		t.Run("server "+field, func(t *testing.T) {
+			yaml := strings.Replace(validServerYAML, field+": ", field+": "+secret+" #", 1)
+			_, err := LoadServerConfig(tempFile(t, "server.yaml", yaml))
+			if err == nil {
+				t.Fatal("want error, got nil")
+			}
+			if leaked := containsAnyPrefix(err.Error()); leaked != "" {
+				t.Errorf("error leaks the value prefix %q: %v", leaked, err)
+			}
+		})
 	}
 }

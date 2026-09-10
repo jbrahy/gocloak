@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -227,9 +228,9 @@ type PeersConfig struct {
 	Policy *Policy
 }
 
-// PeerNames returns the peer names in order, for logging. Only names, never
+// peerNames returns the peer names in order, for logging. Only names, never
 // key material, belong in a log line.
-func PeerNames(peers []PeerConfig) []string {
+func peerNames(peers []PeerConfig) []string {
 	names := make([]string, 0, len(peers))
 	for _, p := range peers {
 		names = append(names, p.Name)
@@ -381,15 +382,56 @@ func decodeStrict(data []byte, v any) error {
 		if errors.Is(err, io.EOF) {
 			return errors.New("empty document")
 		}
-		return err
+		return sanitizeYAMLError(err)
 	}
 	var extra yaml.Node
 	if err := dec.Decode(&extra); err == nil {
 		return errors.New("file contains more than one YAML document")
 	} else if !errors.Is(err, io.EOF) {
-		return err
+		return sanitizeYAMLError(err)
 	}
 	return nil
+}
+
+// sanitizeYAMLError strips scalar values out of yaml.v3's type-mismatch
+// messages, which embed the first seven characters of the offending value.
+// None of the four secret-bearing fields is int-typed, so none can trigger
+// one, but a key pasted into mtu, listen_port or a limits field would put a
+// prefix of that key into an error and from there into a log line, and
+// constraint 4 is unqualified.
+//
+// Unknown-key messages are kept verbatim: they name a key, never a value,
+// and they are the diagnostic an operator needs to find a typo in a
+// security-relevant field.
+func sanitizeYAMLError(err error) error {
+	var te *yaml.TypeError
+	if !errors.As(err, &te) {
+		// Parser errors report structure (a missing colon, a bad
+		// indent), not scalar values.
+		return err
+	}
+	msgs := make([]string, 0, len(te.Errors))
+	for _, m := range te.Errors {
+		if strings.Contains(m, " not found in type ") {
+			msgs = append(msgs, m)
+			continue
+		}
+		msgs = append(msgs, yamlLinePrefix(m)+"value is not valid for this field (value redacted)")
+	}
+	return errors.New("yaml: " + strings.Join(msgs, "; "))
+}
+
+// yamlLinePrefix returns the "line N: " prefix of a yaml.v3 error message,
+// which is the only part of a type-mismatch message safe to keep.
+func yamlLinePrefix(msg string) string {
+	if !strings.HasPrefix(msg, "line ") {
+		return ""
+	}
+	i := strings.Index(msg, ": ")
+	if i < 0 {
+		return ""
+	}
+	return msg[:i+2]
 }
 
 // parseTunnelIP parses a tunnel address and normalizes it. An IPv4-in-IPv6
@@ -467,7 +509,12 @@ func validSecretRef(ref SecretRef) error {
 type PeerDiff struct {
 	Added   []PeerConfig
 	Removed []PeerConfig // the previous entries, so their old keys are available
-	Changed []PeerConfig // the new entries
+	// Changed carries only the NEW entry, not the previous one, so a
+	// consumer cannot compute an old-versus-new allowed-ip delta from it
+	// and must apply it with replace_allowed_ips=true. That is the correct
+	// WireGuard idiom regardless: it makes the device's allowed-ip set
+	// match the file rather than accumulate stale entries.
+	Changed []PeerConfig
 }
 
 // IsEmpty reports whether the reload changed nothing.
@@ -568,14 +615,18 @@ func statFileID(path string) fileID {
 // Call Run to service filesystem events. Call Close when done, even if Run
 // is never called.
 func NewPeerWatcher(path string, onReload func(ReloadResult)) (*PeerWatcher, error) {
-	cfg, err := LoadPeersConfig(path)
-	if err != nil {
-		return nil, err
-	}
-
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("gocloak: config: %s: %w", path, err)
+	}
+
+	// Stat before reading, never after: a write landing between the read
+	// and the stat would otherwise look like the file that was read, and
+	// the periodic re-arm would never notice it.
+	id := statFileID(abs)
+	cfg, err := LoadPeersConfig(abs)
+	if err != nil {
+		return nil, err
 	}
 
 	w := &PeerWatcher{
@@ -583,7 +634,7 @@ func NewPeerWatcher(path string, onReload func(ReloadResult)) (*PeerWatcher, err
 		dir:      filepath.Dir(abs),
 		base:     filepath.Base(abs),
 		onReload: onReload,
-		seen:     statFileID(abs),
+		seen:     id,
 	}
 	w.cur.Store(cfg)
 
@@ -669,9 +720,9 @@ func (w *PeerWatcher) report(r ReloadResult) {
 	slog.Info("gocloak: peers file reloaded",
 		"path", r.Path,
 		"peers", r.PeerCount,
-		"added", PeerNames(r.Diff.Added),
-		"removed", PeerNames(r.Diff.Removed),
-		"changed", PeerNames(r.Diff.Changed))
+		"added", peerNames(r.Diff.Added),
+		"removed", peerNames(r.Diff.Removed),
+		"changed", peerNames(r.Diff.Changed))
 }
 
 // Run services filesystem events until ctx is cancelled, reloading the peers
