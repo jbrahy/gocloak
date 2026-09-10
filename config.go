@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -431,17 +432,36 @@ const (
 	yamlDupKeyPrefix = "mapping key "
 	yamlDupKeySuffix = " already defined at line "
 
+	// yamlFieldPrefix begins both of the field-oriented classes below.
+	yamlFieldPrefix = "field "
+
 	// yamlUnknownFieldMarker matches "field %s not found in type %s", the
 	// unknown-key diagnostic that makes a typo in a security-relevant key
-	// findable.
+	// findable. Its field name comes from the DOCUMENT, so it is kept only
+	// when it looks like a real field name (see yamlFieldNameRE).
 	yamlUnknownFieldMarker = " not found in type "
 
 	// yamlFieldSetMarker matches "field %s already set in type %s". That
 	// name is a resolved struct field, so it comes from this file's own
 	// struct tags and never from the document: a key the struct does not
-	// have would have produced the unknown-field message instead.
+	// have would have produced the unknown-field message instead. It
+	// therefore needs no guard, unlike the unknown-field class.
 	yamlFieldSetMarker = " already set in type "
 )
+
+// yamlFieldNameRE is the shape a document key must have for the
+// unknown-field message to be kept verbatim. Every struct-tag key in this
+// package satisfies it (mtu, listen_port, private_key, psk, tunnel_ip,
+// public_key, peers_file, log_format, dials_per_second, max_concurrent,
+// name, limits, allow, peers), and so does any realistic typo of one
+// (privatekey, prvate_key, psk_ref, tunnelip), which is the diagnostic
+// operators need in a file whose typos silently change access.
+//
+// Key material does not: a base64 key is 44 characters of mixed case with
+// +, / and =, and an AWS secret ARN carries colons and uppercase. Both fail
+// the guard and are redacted, so a secret pasted into a KEY position is
+// never echoed.
+var yamlFieldNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,39}$`)
 
 // sanitizeYAMLMessage redacts one message from a yaml.v3 TypeError, keeping
 // as much diagnostic structure as can be kept without echoing document text.
@@ -463,9 +483,28 @@ func sanitizeYAMLMessage(m string) string {
 		}
 	}
 
-	// Neither of these embeds a value, so both keep their line numbers,
-	// their key or field name, and their type name.
-	if strings.Contains(rest, yamlUnknownFieldMarker) || strings.Contains(rest, yamlFieldSetMarker) {
+	// The unknown-field class. Its name comes from the document, so it is
+	// kept only when it looks like a real field name. LastIndex, not
+	// Index, for the same reason as above: a key that itself contains the
+	// marker must not be split at its own copy of it, which would hand
+	// the guard a short safe-looking prefix and echo the rest.
+	if strings.HasPrefix(rest, yamlFieldPrefix) {
+		if i := strings.LastIndex(rest, yamlUnknownFieldMarker); i >= 0 {
+			name := rest[len(yamlFieldPrefix):i]
+			if yamlFieldNameRE.MatchString(name) {
+				return m
+			}
+			// Only the name is dropped. The line number and the
+			// type name (which is one of this file's own Go
+			// types) still tell the operator where to look.
+			return prefix + yamlFieldPrefix + "(redacted)" + rest[i:]
+		}
+	}
+
+	// The already-set class embeds a resolved struct field name, which
+	// comes from this file's own struct tags and never from the document,
+	// so it needs no guard and keeps its name.
+	if strings.Contains(rest, yamlFieldSetMarker) {
 		return m
 	}
 

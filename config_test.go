@@ -860,3 +860,131 @@ func TestConfigSanitizeYAMLMessageClasses(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigUnknownKeyGuardKeepsRealFieldNames(t *testing.T) {
+	// The unknown-key diagnostic is the whole point of KnownFields(true):
+	// in a file whose typos silently change access, an operator needs to
+	// be told "you typed psk_ref instead of psk". A plausible field name
+	// therefore survives verbatim.
+	for _, key := range []string{"privatekey", "prvate_key", "psk_ref", "tunnelip", "mtu2", "a"} {
+		t.Run(key, func(t *testing.T) {
+			yaml := validServerYAML + key + ": x\n"
+			_, err := LoadServerConfig(tempFile(t, "server.yaml", yaml))
+			if err == nil {
+				t.Fatal("want error for unknown key, got nil")
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error should name the unknown key %q, got: %v", key, err)
+			}
+			if strings.Contains(err.Error(), "(redacted)") {
+				t.Errorf("a plausible field name should not be redacted, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigUnknownKeyGuardRedactsSecretKey(t *testing.T) {
+	// A secret pasted into a KEY position must not be echoed. This class
+	// is not truncated the way a type mismatch is, so leaving it verbatim
+	// would echo the key IN FULL.
+	const secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY123=" // 44 chars, base64 shaped
+	if len(secret) != 44 {
+		t.Fatalf("fixture is %d characters, want a realistic 44", len(secret))
+	}
+
+	yaml := validServerYAML + secret + ": x\n"
+	_, err := LoadServerConfig(tempFile(t, "server.yaml", yaml))
+	if err == nil {
+		t.Fatal("want error for unknown key, got nil")
+	}
+	msg := err.Error()
+	for n := 3; n <= len(secret); n++ {
+		if strings.Contains(msg, secret[:n]) {
+			t.Fatalf("error leaks the key prefix %q: %v", secret[:n], err)
+		}
+	}
+	// The operator still learns where to look.
+	if !strings.Contains(msg, "line 7") {
+		t.Errorf("error should still name the line, got: %v", err)
+	}
+	if !strings.Contains(msg, "(redacted)") || !strings.Contains(msg, "not found in type") {
+		t.Errorf("error should keep the message structure, got: %v", err)
+	}
+}
+
+func TestConfigUnknownKeyGuardRedactsImplausibleNames(t *testing.T) {
+	cases := map[string]string{
+		"uppercase":        "Listen_Port",
+		"over 40 chars":    strings.Repeat("a", 41),
+		"leading digit":    "0mtu",
+		"leading undersco": "_mtu",
+		"hyphenated":       "listen-port",
+		"dotted":           "aws.sm.key",
+	}
+	for name, key := range cases {
+		t.Run(name, func(t *testing.T) {
+			yaml := validServerYAML + key + ": x\n"
+			_, err := LoadServerConfig(tempFile(t, "server.yaml", yaml))
+			if err == nil {
+				t.Fatal("want error for unknown key, got nil")
+			}
+			if strings.Contains(err.Error(), key) {
+				t.Errorf("error echoes an implausible field name: %v", err)
+			}
+			if !strings.Contains(err.Error(), "(redacted)") {
+				t.Errorf("error should say the name was redacted, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigSanitizeYAMLUnknownFieldGuard(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "plausible name kept",
+			in:   "line 7: field psk_ref not found in type gocloak.peerYAML",
+			want: "line 7: field psk_ref not found in type gocloak.peerYAML",
+		},
+		{
+			name: "exactly 40 chars kept",
+			in:   "line 7: field " + strings.Repeat("a", 40) + " not found in type gocloak.peerYAML",
+			want: "line 7: field " + strings.Repeat("a", 40) + " not found in type gocloak.peerYAML",
+		},
+		{
+			name: "41 chars redacted",
+			in:   "line 7: field " + strings.Repeat("a", 41) + " not found in type gocloak.peerYAML",
+			want: "line 7: field (redacted) not found in type gocloak.peerYAML",
+		},
+		{
+			name: "base64 shaped name redacted",
+			in:   "line 7: field wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY123= not found in type gocloak.peerYAML",
+			want: "line 7: field (redacted) not found in type gocloak.peerYAML",
+		},
+		{
+			// A key that carries its own copy of the marker must not
+			// be split at that copy, which would hand the guard a
+			// short safe-looking prefix and echo the remainder.
+			name: "name containing the marker redacted whole",
+			in:   "line 7: field psk not found in type x not found in type gocloak.peerYAML",
+			want: "line 7: field (redacted) not found in type gocloak.peerYAML",
+		},
+		{
+			// The already-set class embeds a resolved struct field
+			// name, never document text, so it keeps its name.
+			name: "already set keeps its resolved field name",
+			in:   "line 4: field mtu already set in type gocloak.serverYAML",
+			want: "line 4: field mtu already set in type gocloak.serverYAML",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeYAMLMessage(tc.in); got != tc.want {
+				t.Errorf("sanitizeYAMLMessage(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
