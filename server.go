@@ -347,10 +347,17 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		// The peer's tunnel address is not in the peer list currently
 		// in force. Cryptokey routing should already have dropped its
 		// packets; reaching here means the peer was revoked mid
-		// connection. Deny.
-		_ = s.respond(conn, StatusDenied)
-		s.logger.Warn("gocloak: connection from an address with no peer entry",
-			"peer", peer, "status", StatusDenied.String(), "duration_ms", millis(start))
+		// connection, or a RemovePeer failed and left a revoked keypair
+		// live on the device.
+		//
+		// Nothing is written back. A status frame is a metered reply,
+		// and the limiter is exactly what this path failed to find, so
+		// answering here would hand an unmetered two bytes per
+		// connection to a peer that is owed nothing. Closing in silence
+		// is the fail-closed reading: spec section 7.1 makes silence to
+		// an unauthorized party a designed property, not an oversight.
+		s.logger.Warn("gocloak: connection from an address with no peer entry, closed without a reply",
+			"peer", peer, "duration_ms", millis(start))
 		return
 	}
 	if reason, allowed := limiter.acquire(time.Now()); !allowed {
@@ -407,6 +414,15 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	defer backendConn.Close()
+
+	// From here the connection is a live proxy pair, and after the
+	// response below it has no deadlines left to expire it. Registering it
+	// against the peer's limiter is what lets a revocation reap it: spec
+	// section 8.2's "existing conns error out" has to hold when the peer
+	// is removed too, not only when the tunnel drops.
+	live := &liveConn{peerConn: conn, backendConn: backendConn}
+	limiter.track(live)
+	defer limiter.untrack(live)
 
 	if err := s.respond(conn, StatusOK); err != nil {
 		s.logger.Warn("gocloak: could not write the hello response",
@@ -532,10 +548,22 @@ func (s *Server) limiterFor(ip netip.Addr) (*peerLimiter, bool) {
 // refreshPeers rebuilds the name map and the limiter set from the peer list
 // now in force. A limiter for a peer that survived the reload is kept, so
 // its in-flight connections keep their accounting; a limiter for a peer
-// that is gone is dropped.
+// that is gone is dropped, and every connection still proxying for that peer
+// is closed.
+//
+// The close matters: removing the peer from the device stops it sending, but
+// an already-established connection is a raw pipe with its deadlines cleared,
+// so without this its backend connection and both file descriptors would stay
+// open for as long as the backend held them, and the peer's concurrency slot
+// would never be returned. Spec section 8.2 requires existing connections to
+// error out, on the server side as well as the client side.
 func (s *Server) refreshPeers(cfg *PeersConfig) {
+	// Populated under the lock, closed after it is released: closing a
+	// connection wakes the handler that owns it, and that handler takes
+	// the limiter's own lock on its way out.
+	var gone []*peerLimiter
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	names := make(map[netip.Addr]string, len(cfg.Peers))
 	limiters := make(map[netip.Addr]*peerLimiter, len(cfg.Peers))
@@ -557,8 +585,24 @@ func (s *Server) refreshPeers(cfg *PeersConfig) {
 		}
 		limiters[ip] = newPeerLimiter(p.Limits)
 	}
+
+	kept := make(map[*peerLimiter]struct{}, len(limiters))
+	for _, l := range limiters {
+		kept[l] = struct{}{}
+	}
+	for _, l := range s.limiters {
+		if _, ok := kept[l]; !ok {
+			gone = append(gone, l)
+		}
+	}
+
 	s.peerNames = names
 	s.limiters = limiters
+	s.mu.Unlock()
+
+	for _, l := range gone {
+		l.closeLive()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -578,8 +622,27 @@ func (s *Server) handleReload(r ReloadResult) {
 		return
 	}
 
-	applyErr := s.applyDiff(r.Diff)
+	// refreshPeers runs first, and the ordering is load bearing in both
+	// directions.
+	//
+	// Added peer: applyDiff installs the keypair and the watcher has
+	// already swapped in the new policy, so running applyDiff first left a
+	// window where a brand new peer could hand shake, be granted its
+	// service, and still be refused for having no limiter entry. Building
+	// the limiter set first closes that window.
+	//
+	// Removed peer: still fail closed. The policy swap already happened
+	// inside the watcher before this callback, so the removed peer's
+	// grants are gone regardless. refreshPeers now drops its limiter and
+	// closes its in-flight connections, and every later connection from it
+	// hits the no-entry path above and is closed in silence. applyDiff
+	// then destroys the keypair. Every step in that window denies; none of
+	// them grants.
+	//
+	// The ordering inside applyDiff is untouched: removals still go first
+	// there.
 	s.refreshPeers(s.watcher.Config())
+	applyErr := s.applyDiff(r.Diff)
 	s.pruneSecretCache()
 
 	switch {
@@ -682,6 +745,13 @@ func (s *Server) applyPeer(ctx context.Context, p PeerConfig, updateOnly bool) e
 // resolveSecret resolves a reference, caching the result so a reload does
 // not re-hit the secret store for a peer whose reference did not change.
 //
+// The cache is keyed by reference and lives for the process lifetime, so a
+// secret rotated IN PLACE under the same reference is never picked up
+// without a restart. Rotate by writing the new value under a new reference
+// and pointing peers.yaml at it, which reloads like any other edit.
+// Revocation is unaffected either way: it removes the peer from the device
+// rather than depending on the value behind a reference.
+//
 // The returned error never carries the reference itself: secret.go's errors
 // name the reference they failed on, and constraint 4 keeps a reference out
 // of a log line, so it is scrubbed here rather than at every call site.
@@ -764,6 +834,12 @@ const redactedRefPlaceholder = "[REDACTED REF]"
 // A dial that is refused for concurrency has already spent its token. That
 // is deliberate: a peer hammering a full concurrency cap should not bank a
 // full burst for the moment a slot frees up.
+//
+// It also owns the set of connections currently proxying for that peer, so
+// a revocation can reap them. The limiter is the natural home for that set:
+// it is already the per-peer object, already created and dropped by
+// refreshPeers on exactly the reload boundary a revocation crosses, and
+// already the thing that counts a connection as live.
 type peerLimiter struct {
 	mu            sync.Mutex
 	maxConcurrent int
@@ -772,10 +848,19 @@ type peerLimiter struct {
 	tokens        float64
 	last          time.Time
 	active        int
+	live          map[*liveConn]struct{}
+}
+
+// liveConn is one proxied connection: the peer side and the backend side.
+// Closing both is what unblocks the io.Copy pair in pipeConns and lets
+// handleConn unwind through its own defers.
+type liveConn struct {
+	peerConn    net.Conn
+	backendConn net.Conn
 }
 
 func newPeerLimiter(l PeerLimits) *peerLimiter {
-	p := &peerLimiter{last: time.Now()}
+	p := &peerLimiter{last: time.Now(), live: map[*liveConn]struct{}{}}
 	p.setLimits(l)
 	p.mu.Lock()
 	p.tokens = p.burst
@@ -831,5 +916,40 @@ func (p *peerLimiter) release() {
 	defer p.mu.Unlock()
 	if p.active > 0 {
 		p.active--
+	}
+}
+
+// track registers a proxied connection as live for this peer.
+func (p *peerLimiter) track(c *liveConn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.live[c] = struct{}{}
+}
+
+// untrack deregisters a proxied connection that has finished on its own.
+func (p *peerLimiter) untrack(c *liveConn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.live, c)
+}
+
+// closeLive closes both sides of every connection still proxying for this
+// peer. It is called when the peer leaves the peer list.
+//
+// The set is drained under the lock and the closes happen outside it: each
+// close wakes the handler that owns that connection, and that handler calls
+// untrack and release on its way out, which take this same lock.
+func (p *peerLimiter) closeLive() {
+	p.mu.Lock()
+	conns := make([]*liveConn, 0, len(p.live))
+	for c := range p.live {
+		conns = append(conns, c)
+	}
+	clear(p.live)
+	p.mu.Unlock()
+
+	for _, c := range conns {
+		c.peerConn.Close()
+		c.backendConn.Close()
 	}
 }

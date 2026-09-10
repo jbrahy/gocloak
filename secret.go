@@ -28,8 +28,12 @@ type Secret struct {
 	value []byte
 }
 
-// Bytes returns the resolved key material.
-func (s Secret) Bytes() []byte {
+// bytes returns the resolved key material. It is deliberately unexported:
+// it is the only accessor that hands raw key material to a caller, and
+// nothing outside this package needs one. Keeping it in-package means the
+// set of code that can hold a plaintext key is the set of code in this
+// repository.
+func (s Secret) bytes() []byte {
 	return s.value
 }
 

@@ -108,8 +108,8 @@ func TestSecretResolve(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Resolve(%q) unexpected error: %v", tt.ref, err)
 			}
-			if string(got.Bytes()) != tt.want {
-				t.Fatalf("Resolve(%q) = %q, want %q", tt.ref, got.Bytes(), tt.want)
+			if string(got.bytes()) != tt.want {
+				t.Fatalf("Resolve(%q) = %q, want %q", tt.ref, got.bytes(), tt.want)
 			}
 		})
 	}

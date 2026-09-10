@@ -61,7 +61,7 @@ func deviceTestSecret(b64 string) Secret {
 
 // deviceTestB64 returns a Secret's base64 text, for assertions only.
 func deviceTestB64(s Secret) string {
-	return string(s.Bytes())
+	return string(s.bytes())
 }
 
 // deviceTestFreeUDPPort picks a UDP port that is free right now.

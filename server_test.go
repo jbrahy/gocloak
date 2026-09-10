@@ -826,6 +826,135 @@ func TestServerHotReloadRevokesAPeer(t *testing.T) {
 	}
 }
 
+// TestServerRevocationClosesInFlightProxiedConnections covers the server
+// side of spec section 8.2's "existing conns error out".
+//
+// TestSecurityRevokedPeerCanNoLongerConnect closes its connections before it
+// revokes, so it proves only that a revoked peer cannot establish anything
+// new. It cannot see what happens to a connection that is still proxying at
+// the instant of the revocation, and that is the case this test holds open:
+// removing the peer stops it sending, but an established connection is a raw
+// pipe with its deadlines cleared, so without an explicit reap its backend
+// connection and both file descriptors stay open indefinitely and the peer's
+// concurrency slot is never returned.
+//
+// The two assertions are made server side on purpose. The revoked peer's
+// keypair is destroyed moments after the reap, so whether the FIN reaches the
+// client is a race on the wire and not a property worth asserting. What the
+// server owes is that the handler unwound and the backend socket was let go,
+// and both of those are observable here without racing anything.
+func TestServerRevocationClosesInFlightProxiedConnections(t *testing.T) {
+	doomedReleased := make(chan struct{})
+	var releaseOnce sync.Once
+	doomedBackend := serverTestNewBackend(t, func(c net.Conn) {
+		defer c.Close()
+		io.Copy(c, c)
+		releaseOnce.Do(func() { close(doomedReleased) })
+	})
+	survivorBackend := serverTestNewBackend(t, serverTestEcho)
+
+	doomed := serverTestNewPeer(t, "app-doomed", "10.99.0.7")
+	doomed.Allow["db"] = doomedBackend.String()
+	survivor := serverTestNewPeer(t, "app-survivor", "10.99.0.8")
+	survivor.Allow["db"] = survivorBackend.String()
+
+	h := serverTestStart(t, doomed, survivor)
+	doomedClient := h.client(doomed)
+	survivorClient := h.client(survivor)
+
+	// exchange proves the connection is a working proxy, not merely a
+	// connection the server said ok to. A reap test whose "before" state
+	// never carried bytes proves nothing.
+	exchange := func(conn net.Conn, who string) {
+		t.Helper()
+		if err := conn.SetDeadline(time.Now().Add(serverTestDialBudget)); err != nil {
+			t.Fatalf("%s: set deadline: %v", who, err)
+		}
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatalf("%s: write to backend: %v", who, err)
+		}
+		buf := make([]byte, 4)
+		if _, err := readFullConn(conn, buf); err != nil {
+			t.Fatalf("%s: read from backend: %v", who, err)
+		}
+		if string(buf) != "ping" {
+			t.Fatalf("%s: backend echoed %q, want %q", who, buf, "ping")
+		}
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			t.Fatalf("%s: clear deadline: %v", who, err)
+		}
+	}
+
+	doomedConn, status := serverTestHello(t, doomedClient, "db")
+	if status != StatusOK {
+		t.Fatalf("doomed peer: status = %v, want ok", status)
+	}
+	exchange(doomedConn, "doomed peer before revocation")
+
+	survivorConn, status := serverTestHello(t, survivorClient, "db")
+	if status != StatusOK {
+		t.Fatalf("surviving peer: status = %v, want ok", status)
+	}
+	exchange(survivorConn, "surviving peer before revocation")
+
+	if got := doomedBackend.conns.Load(); got != 1 {
+		t.Fatalf("doomed backend saw %d connections, want 1", got)
+	}
+
+	// Revoke through the real peers.yaml hot reload path, with both
+	// connections still open and still in the middle of their session.
+	serverTestWritePeers(t, h.peersPath, []*serverTestPeer{survivor})
+
+	got := h.awaitReload()
+	if got.res.Err != nil {
+		t.Fatalf("reload reported a parse error: %v", got.res.Err)
+	}
+	if got.err != nil {
+		t.Fatalf("applying the reload to the live device failed: %v", got.err)
+	}
+	if names := peerNames(got.res.Diff.Removed); len(names) != 1 || names[0] != "app-doomed" {
+		t.Fatalf("diff removed %v, want exactly [app-doomed]", names)
+	}
+
+	// 1. The backend connection is released, so the file descriptor and
+	//    whatever the backend was holding for that session are freed.
+	select {
+	case <-doomedReleased:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the revoked peer's backend connection was never released: an in-flight proxied connection outlived the revocation")
+	}
+
+	// 2. The handler unwound. handleConn logs this line only after
+	//    pipeConns has returned, which happens only once both sides of the
+	//    proxy are closed, so the line is proof the peer-side connection
+	//    was closed and the concurrency slot returned.
+	if !serverTestAwaitLogLine(t, h, `"gocloak: connection closed"`, `"peer":"app-doomed"`, 20*time.Second) {
+		t.Fatalf("the revoked peer's connection handler never unwound; logs:\n%s", h.logs.String())
+	}
+
+	// The surviving peer is untouched, so the reap closed one peer's
+	// connections rather than everything on the device.
+	exchange(survivorConn, "surviving peer after revocation")
+}
+
+// serverTestAwaitLogLine polls the captured log for a single line containing
+// every one of want, and reports whether it appeared within budget.
+func serverTestAwaitLogLine(t *testing.T, h *serverHarness, first, second string, budget time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for {
+		for line := range strings.SplitSeq(h.logs.String(), "\n") {
+			if strings.Contains(line, first) && strings.Contains(line, second) {
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // TestServerHotReloadAddsAPeer covers the other direction: a peer added to
 // the file becomes usable without a restart.
 func TestServerHotReloadAddsAPeer(t *testing.T) {

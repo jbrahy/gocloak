@@ -5,10 +5,10 @@ authenticated byte stream to a named backend service that is reachable only
 from a remote endpoint. `client.Dial(ctx, "primary-db")` returns an ordinary
 `net.Conn`. The endpoint sits on the public internet and is assumed to be under
 constant hostile attention, so it answers nothing it cannot authenticate: to
-anyone without the right keys it is indistinguishable from a filtered port. It
-is for operators who need an application outside a VPC to reach a small, fixed
-set of services inside one, without a bastion host, without a TUN device,
-without root, and without a certificate authority.
+anyone without the server public key it is indistinguishable from a filtered
+port. It is for operators who need an application outside a VPC to reach a
+small, fixed set of services inside one, without a bastion host, without a TUN
+device, without root, and without a certificate authority.
 
 Before you deploy it, read
 [What goCloak does not protect against](#what-gocloak-does-not-protect-against).
@@ -94,6 +94,12 @@ psk written to: /etc/gocloak/app-01.psk
 
 `--dir` is optional and defaults to the current directory. The private key is
 never printed, only the path it was written to.
+
+The `psk:` line is the one place this tool ever emits a live secret, so treat
+that terminal as sensitive: the value lands in scrollback, in any session
+recording or CI job log, and in shell history if you pipe or re-echo it. Move
+it into your secret store and clear the scrollback rather than leaving it
+sitting in a window.
 
 The peer's `public_key` goes into `peers.yaml` verbatim. The peer's PSK goes
 into your secret store, and `peers.yaml` carries a reference to it, not the
@@ -241,7 +247,11 @@ that you sent it.
 **2. Silent to strangers, not steganographic.** Anyone who already holds the
 server public key can confirm the endpoint exists. Invisibility here means the
 endpoint does not answer unauthenticated traffic, not that a determined party
-who has the key cannot tell it is there.
+who has the key cannot tell it is there. Nor is the silence keyed on the PSK: a
+party holding a valid client key but the wrong PSK still draws a Noise message
+2 back, because IKpsk2 mixes the PSK into message 2 rather than message 1. The
+handshake then fails and no session is established, but the response itself
+confirms the endpoint.
 
 **3. Client host compromise is peer compromise.** No secret survives root on the
 client. An attacker with that access has the peer's key and PSK and can reach
@@ -343,6 +353,14 @@ An unknown scheme is an error, never a fallback to treating the string as a
 literal key. If the secret store is unreachable at startup the server exits
 non-zero rather than starting on a stale peer list, which would keep revoked
 peers alive.
+
+**Rotation is not revocation, and rotation does need a restart.** The server
+resolves each reference once and caches the value for the process lifetime, so
+changing a PSK in place under the same reference is never picked up by a
+reload. Rotate by writing the new value under a new reference and pointing
+`peers.yaml` at that, or restart the server. Revocation is unaffected: it
+removes the peer from the live device rather than depending on the value behind
+a reference.
 
 **A dropped tunnel errors the connections that were on it.** There is no
 transparent per-connection reconnect, because silently re-establishing a

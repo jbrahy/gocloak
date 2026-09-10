@@ -132,7 +132,7 @@ func newTunnelDevice(opts deviceOptions) (*tunnelDevice, error) {
 		return nil, fmt.Errorf("gocloak: device: mtu %d is not in %d-%d", mtu, MinMTU, MaxMTU)
 	}
 
-	privateKey, err := keyToHex(string(opts.PrivateKey.Bytes()))
+	privateKey, err := keyToHex(string(opts.PrivateKey.bytes()))
 	if err != nil {
 		return nil, fmt.Errorf("gocloak: device: private key: %w", err)
 	}
@@ -211,6 +211,15 @@ func (d *tunnelDevice) applyPeer(p devicePeer, updateOnly bool) error {
 		return err
 	}
 	// cfg carries the preshared key. Never log it.
+	//
+	// wireguard-go's IpcSetOperation logs every error it returns, and two
+	// of its message shapes quote the offending UAPI value, which for a
+	// key line would be key bytes. That path is closed here, not there:
+	// ipcConfig renders every key through keyToHex, which base64-decodes
+	// and requires exactly 32 bytes before it hex-encodes, so a malformed
+	// key is rejected above and never reaches the UAPI parser. Any future
+	// edit that writes a key line without going through keyToHex reopens
+	// it.
 	if err := d.dev.IpcSet(cfg); err != nil {
 		return fmt.Errorf("gocloak: device: apply peer: %w", err)
 	}
@@ -224,7 +233,7 @@ func (p devicePeer) ipcConfig(updateOnly bool) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("gocloak: device: peer: public key: %w", err)
 	}
-	psk, err := keyToHex(string(p.PresharedKey.Bytes()))
+	psk, err := keyToHex(string(p.PresharedKey.bytes()))
 	if err != nil {
 		return "", fmt.Errorf("gocloak: device: peer: preshared key: %w", err)
 	}

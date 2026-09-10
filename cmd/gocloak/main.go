@@ -45,7 +45,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "keygen":
 		return runKeygen(args[1:], stdout, stderr)
 	case "serve":
-		return runServe(args[1:], stdout, stderr)
+		return runServe(args[1:], stderr)
 	case "-h", "-help", "--help":
 		printUsage(stdout)
 		return 0
@@ -236,7 +236,7 @@ func writeSecretFile(path, content string) error {
 // it until SIGINT or SIGTERM. Per spec section 8.2 the server must fail
 // closed: any startup error is logged and the process exits non-zero,
 // never starting degraded and never retrying into a started state.
-func runServe(args []string, stdout, stderr io.Writer) int {
+func runServe(args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to server.yaml")
