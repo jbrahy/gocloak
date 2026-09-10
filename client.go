@@ -494,7 +494,7 @@ func (c *Client) handshakeTimeoutError(waited time.Duration) error {
 		"The endpoint does not answer unauthenticated traffic, so this means one of: "+
 		"wrong server public key, wrong client key, revoked peer, wrong PSK, "+
 		"UDP blocked on this network, or the endpoint is down. "+
-		"The server cannot tell you which. Check the server log for a peer entry.",
+		"The server cannot tell you which. Check the server log for a peer entry",
 		ErrHandshakeTimeout, c.endpointText, waited)
 }
 

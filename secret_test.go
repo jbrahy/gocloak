@@ -162,9 +162,13 @@ func TestSecretStringRedacted(t *testing.T) {
 		repr string
 	}{
 		{"value %v", fmt.Sprintf("%v", s)},
+		//lint:ignore S1025 deliberately exercising fmt's %s verb to confirm it
+		// routes through Secret's Stringer instead of calling String() directly
 		{"value %s", fmt.Sprintf("%s", s)},
 		{"value %#v", fmt.Sprintf("%#v", s)},
 		{"pointer %v", fmt.Sprintf("%v", p)},
+		//lint:ignore S1025 deliberately exercising fmt's %s verb to confirm it
+		// routes through Secret's Stringer instead of calling String() directly
 		{"pointer %s", fmt.Sprintf("%s", p)},
 		{"pointer %#v", fmt.Sprintf("%#v", p)},
 	}
