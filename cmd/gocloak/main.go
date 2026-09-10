@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -77,6 +78,9 @@ func runKeygen(args []string, stdout, stderr io.Writer) int {
 	name := fs.String("name", "", "peer name")
 	dir := fs.String("dir", "", "directory to write key files (default: current directory)")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 
@@ -124,6 +128,14 @@ func runKeygen(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := writeSecretFile(pskPath, base64.StdEncoding.EncodeToString(psk)); err != nil {
+		// The private key file was already written successfully. Leaving
+		// it behind here would orphan a key with no matching PSK on disk
+		// and would also mean a retry of this exact command fails on the
+		// O_EXCL guard instead of succeeding, so it is removed on this
+		// path. Best effort: if the removal itself fails, the write
+		// error below is still reported and is what matters to the
+		// operator.
+		_ = os.Remove(keyPath)
 		fmt.Fprintf(stderr, "gocloak: keygen: %v\n", err)
 		return 1
 	}
@@ -182,6 +194,13 @@ func generatePSK() ([]byte, error) {
 // overwrite an existing file. Clobbering a peer's existing private key or
 // PSK would be a self-inflicted outage, so O_EXCL makes that impossible
 // rather than merely unlikely.
+//
+// The write is synced and Close's error is checked explicitly, and on any
+// write, sync, or close failure the partial file is removed before
+// returning. Without that, a failed close could leave a zero-length file
+// on disk that the O_EXCL guard above would then permanently refuse to
+// regenerate: this is the one file whose loss has no recovery path short
+// of an operator manually deleting it, so a retry must be able to succeed.
 func writeSecretFile(path, content string) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -190,9 +209,20 @@ func writeSecretFile(path, content string) error {
 		}
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-	defer f.Close()
+
 	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(path)
 		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(path)
+		return fmt.Errorf("sync %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return fmt.Errorf("close %s: %w", path, err)
 	}
 	return nil
 }
@@ -204,13 +234,16 @@ func writeSecretFile(path, content string) error {
 // runServe implements the serve subcommand. It loads server.yaml, builds
 // the daemon's own logger from log_format, constructs the server, and runs
 // it until SIGINT or SIGTERM. Per spec section 8.2 the server must fail
-// closed: any startup error is printed and the process exits non-zero,
+// closed: any startup error is logged and the process exits non-zero,
 // never starting degraded and never retrying into a started state.
 func runServe(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to server.yaml")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	if *configPath == "" {
@@ -218,29 +251,44 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// Before the config is loaded, log_format is not yet known, so a
+	// load failure is reported through a default JSON logger, matching
+	// the format the library itself defaults to when no daemon has set
+	// one.
+	logger := slog.New(slog.NewJSONHandler(stderr, nil))
+
 	fc, err := gocloak.LoadServerConfig(*configPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "gocloak: serve: %v\n", err)
+		logger.Error("gocloak: serve: could not load config", "error", err.Error())
 		return 1
 	}
 
 	// Carried requirement from the task 7 review: ServerConfigFrom drops
-	// log_format because the library's own request-handling logs are
-	// always JSON (constraint 4). log_format is not inert, though: it
-	// configures the handler for the daemon's own startup/shutdown
-	// output, so the key still does something rather than being silently
-	// ignored, per spec section 6's "fail loudly, never silently ignore".
+	// log_format because spec section 5's ServerConfig has no such field.
+	// log_format is not inert, though: it configures the handler used for
+	// the whole process's output, so the key still does something rather
+	// than being silently ignored, per spec section 6's "fail loudly,
+	// never silently ignore".
+	//
+	// slog.SetDefault makes this the process-wide default handler, which
+	// NewServer picks up below via slog.Default() (see server.go). That
+	// is what makes log_format govern the whole process rather than just
+	// this command's own lines: the daemon's own output and the
+	// library's connection logs then share one handler writing to one
+	// stream, instead of two differently-formatted writers interleaved on
+	// the same file descriptor.
 	handler, err := newLogHandler(fc.LogFormat, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "gocloak: serve: %v\n", err)
+		logger.Error("gocloak: serve: could not build log handler", "error", err.Error())
 		return 1
 	}
-	logger := slog.New(handler)
+	logger = slog.New(handler)
+	slog.SetDefault(logger)
 
 	cfg := gocloak.ServerConfigFrom(fc)
 	srv, err := gocloak.NewServer(cfg)
 	if err != nil {
-		fmt.Fprintf(stderr, "gocloak: serve: %v\n", err)
+		logger.Error("gocloak: serve: could not construct server", "error", err.Error())
 		return 1
 	}
 
@@ -249,7 +297,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 
 	logger.Info("gocloak: starting", "config", *configPath)
 	if err := srv.Run(ctx); err != nil {
-		fmt.Fprintf(stderr, "gocloak: serve: %v\n", err)
+		logger.Error("gocloak: serve: server run failed", "error", err.Error())
 		return 1
 	}
 	logger.Info("gocloak: stopped")

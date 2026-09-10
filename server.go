@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,9 +62,12 @@ type ServerConfig struct {
 // every field. A nil argument yields the zero ServerConfig, which NewServer
 // then rejects: there is no path where a missing config starts a server.
 //
-// ServerFileConfig.LogFormat is deliberately not carried over. The server's
-// own log output is always JSON (constraint 4); log_format governs the
-// daemon's logging, not the library's.
+// ServerFileConfig.LogFormat is deliberately not carried over: spec
+// section 5's ServerConfig has no such field. NewServer instead logs
+// through slog.Default(), so a daemon that wants log_format to take
+// effect sets the process-wide default (cmd/gocloak's serve command does
+// this) before calling NewServer; absent that, slog.Default() is JSON,
+// matching constraint 4's baseline.
 func ServerConfigFrom(fc *ServerFileConfig) ServerConfig {
 	if fc == nil {
 		return ServerConfig{}
@@ -167,7 +169,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	return &Server{
 		cfg:       cfg,
-		logger:    slog.New(slog.NewJSONHandler(os.Stderr, nil)),
+		logger:    slog.Default(),
 		peerNames: map[netip.Addr]string{},
 		limiters:  map[netip.Addr]*peerLimiter{},
 		pskCache:  map[SecretRef]Secret{},

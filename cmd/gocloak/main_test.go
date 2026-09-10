@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	gocloak "github.com/jbrahy/gocloak"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -137,6 +138,31 @@ func TestKeygenDerivedPublicKeyMatchesPrinted(t *testing.T) {
 	}
 }
 
+// TestKeygenGeneratedKeyLoadsIntoAPeersConfig is a cheap interop check:
+// gocloak.LoadPeersConfig is exported and reachable from this external
+// package, so a generated public key can be pasted into a peers.yaml and
+// loaded the way an operator's real peers.yaml would be. This does not
+// prove a tunnel handshake succeeds (task 10 owns that), only that
+// keygen's output is accepted by the config layer it is meant to feed.
+func TestKeygenGeneratedKeyLoadsIntoAPeersConfig(t *testing.T) {
+	dir := t.TempDir()
+	code, stdout, stderr := runCLI("keygen", "--name", "app-interop", "--dir", dir)
+	if code != 0 {
+		t.Fatalf("keygen exited %d, stderr: %s", code, stderr)
+	}
+	out := parseKeygenOutput(t, stdout)
+
+	peersYAML := fmt.Sprintf("peers:\n  - name: app-interop\n    public_key: %s\n    psk: env:GOCLOAK_CMD_TEST_INTEROP_PSK\n    tunnel_ip: 10.99.0.7\n", out.PublicKeyB64)
+	peersPath := filepath.Join(dir, "peers.yaml")
+	if err := os.WriteFile(peersPath, []byte(peersYAML), 0o600); err != nil {
+		t.Fatalf("write peers.yaml: %v", err)
+	}
+
+	if _, err := gocloak.LoadPeersConfig(peersPath); err != nil {
+		t.Fatalf("LoadPeersConfig rejected a keygen-produced public key: %v", err)
+	}
+}
+
 func TestKeygenPrivateKeyFileIsMode0600(t *testing.T) {
 	dir := t.TempDir()
 	code, _, stderr := runCLI("keygen", "--name", "app-03", "--dir", dir)
@@ -224,6 +250,14 @@ func TestKeygenRefusesToOverwriteAnExistingPSKFile(t *testing.T) {
 	}
 	if string(content) != "preexisting" {
 		t.Fatal("existing psk file content was changed")
+	}
+
+	// The private key file was written before the psk write failed. It
+	// must not be left behind as an orphan with no matching psk: a
+	// second run for this exact name must be able to succeed rather than
+	// hitting the O_EXCL guard on a key file from a failed attempt.
+	if _, err := os.Stat(filepath.Join(dir, "app-06.key")); !os.IsNotExist(err) {
+		t.Fatalf("private key file was not cleaned up after the psk write failed: stat error = %v", err)
 	}
 }
 
@@ -457,6 +491,54 @@ func TestServeRequiresConfigFlag(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "--config") {
 		t.Errorf("stderr does not mention --config: %q", stderr)
+	}
+}
+
+// TestHelpExitsZeroTopLevelAndSubcommand checks that -h/--help exits 0
+// consistently, both at the top level and on a subcommand's own flag set.
+// flag.ContinueOnError makes fs.Parse return flag.ErrHelp for -h, which
+// must be special-cased back to a 0 exit rather than falling through to
+// the general parse-error path.
+func TestHelpExitsZeroTopLevelAndSubcommand(t *testing.T) {
+	if code, _, _ := runCLI("--help"); code != 0 {
+		t.Errorf("gocloak --help exited %d, want 0", code)
+	}
+	if code, _, _ := runCLI("keygen", "-h"); code != 0 {
+		t.Errorf("gocloak keygen -h exited %d, want 0", code)
+	}
+	if code, _, _ := runCLI("serve", "-h"); code != 0 {
+		t.Errorf("gocloak serve -h exited %d, want 0", code)
+	}
+}
+
+// TestServeFatalErrorGoesThroughTheConfiguredLogger checks that a fatal
+// startup error is emitted through the same handler as "starting"/
+// "stopped", not through a raw fmt.Fprintf that bypasses log_format. With
+// log_format: text, an unresolvable secret's error line must read as
+// slog text (key=value), not as an unformatted bare message and not as
+// JSON.
+func TestServeFatalErrorGoesThroughTheConfiguredLogger(t *testing.T) {
+	os.Unsetenv("GOCLOAK_CMD_TEST_LOGGER_ROUTE_UNSET")
+
+	dir := t.TempDir()
+	peersPath := filepath.Join(dir, "peers.yaml")
+	writeValidPeersYAML(t, peersPath)
+
+	serverPath := filepath.Join(dir, "server.yaml")
+	content := fmt.Sprintf(validServeServerYAML, "env:GOCLOAK_CMD_TEST_LOGGER_ROUTE_UNSET", peersPath) + "log_format: text\n"
+	if err := os.WriteFile(serverPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write server.yaml: %v", err)
+	}
+
+	code, _, stderr := runCLI("serve", "--config", serverPath)
+	if code == 0 {
+		t.Fatal("serve with an unresolvable secret exited 0, want non-zero")
+	}
+	if !strings.Contains(stderr, "level=ERROR") {
+		t.Errorf("fatal error was not emitted through the slog text handler: %q", stderr)
+	}
+	if strings.Contains(stderr, `"level"`) {
+		t.Errorf("fatal error looks like JSON despite log_format: text: %q", stderr)
 	}
 }
 
