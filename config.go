@@ -400,9 +400,11 @@ func decodeStrict(data []byte, v any) error {
 // prefix of that key into an error and from there into a log line, and
 // constraint 4 is unqualified.
 //
-// Unknown-key messages are kept verbatim: they name a key, never a value,
-// and they are the diagnostic an operator needs to find a typo in a
-// security-relevant field.
+// Classification is per message, because yaml.v3 appends three distinct
+// classes into one TypeError. See sanitizeYAMLMessage: unknown-field and
+// already-set messages are kept verbatim, a duplicate mapping key keeps both
+// its line numbers but loses the key, and everything else keeps only its
+// line number.
 func sanitizeYAMLError(err error) error {
 	var te *yaml.TypeError
 	if !errors.As(err, &te) {
@@ -412,13 +414,64 @@ func sanitizeYAMLError(err error) error {
 	}
 	msgs := make([]string, 0, len(te.Errors))
 	for _, m := range te.Errors {
-		if strings.Contains(m, " not found in type ") {
-			msgs = append(msgs, m)
-			continue
-		}
-		msgs = append(msgs, yamlLinePrefix(m)+"value is not valid for this field (value redacted)")
+		msgs = append(msgs, sanitizeYAMLMessage(m))
 	}
 	return errors.New("yaml: " + strings.Join(msgs, "; "))
+}
+
+// Markers for the three message classes yaml.v3 appends into one TypeError.
+// They differ in whether they can carry text taken from the document, which
+// is the only thing that decides whether a message may be kept verbatim.
+const (
+	// yamlDupKeyPrefix and yamlDupKeySuffix bracket
+	// "mapping key %#v already defined at line %d". The key is arbitrary
+	// document text (under allow: it is operator-supplied, and this fires
+	// during decode, before ValidServiceName ever runs), so the key is
+	// redacted and only the two line numbers survive.
+	yamlDupKeyPrefix = "mapping key "
+	yamlDupKeySuffix = " already defined at line "
+
+	// yamlUnknownFieldMarker matches "field %s not found in type %s", the
+	// unknown-key diagnostic that makes a typo in a security-relevant key
+	// findable.
+	yamlUnknownFieldMarker = " not found in type "
+
+	// yamlFieldSetMarker matches "field %s already set in type %s". That
+	// name is a resolved struct field, so it comes from this file's own
+	// struct tags and never from the document: a key the struct does not
+	// have would have produced the unknown-field message instead.
+	yamlFieldSetMarker = " already set in type "
+)
+
+// sanitizeYAMLMessage redacts one message from a yaml.v3 TypeError, keeping
+// as much diagnostic structure as can be kept without echoing document text.
+func sanitizeYAMLMessage(m string) string {
+	prefix := yamlLinePrefix(m)
+	rest := m[len(prefix):]
+
+	// The duplicate-key class is tested FIRST and by prefix, not by a
+	// loose substring. Its key is arbitrary document text, so a key
+	// containing the marker of another class would otherwise be
+	// classified into that class and kept verbatim. The other two classes
+	// begin "field ", so they can never be mistaken for this one.
+	if strings.HasPrefix(rest, yamlDupKeyPrefix) {
+		// LastIndex, not Index: a key that itself contains the suffix
+		// must not truncate the message early. The real suffix is
+		// always the last one.
+		if i := strings.LastIndex(rest, yamlDupKeySuffix); i >= 0 {
+			return prefix + yamlDupKeyPrefix + "(redacted)" + rest[i:]
+		}
+	}
+
+	// Neither of these embeds a value, so both keep their line numbers,
+	// their key or field name, and their type name.
+	if strings.Contains(rest, yamlUnknownFieldMarker) || strings.Contains(rest, yamlFieldSetMarker) {
+		return m
+	}
+
+	// Everything else in a TypeError is a type mismatch, whose text
+	// embeds the first seven characters of the offending scalar.
+	return prefix + "value is not valid for this field (value redacted)"
 }
 
 // yamlLinePrefix returns the "line N: " prefix of a yaml.v3 error message,

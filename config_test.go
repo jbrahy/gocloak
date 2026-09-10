@@ -756,3 +756,107 @@ func TestConfigYAMLTypeErrorRedactsValue(t *testing.T) {
 		})
 	}
 }
+
+// dupAllowKeyYAML renders a peers file whose allow map defines the same
+// service key twice, at lines 7 and 8.
+func dupAllowKeyYAML(key string) string {
+	return fmt.Sprintf(`peers:
+  - name: app-01
+    public_key: %s
+    psk: env:PSK
+    tunnel_ip: 10.99.0.7
+    allow:
+      %s: 192.0.2.10:3306
+      %s: 192.0.2.11:6379
+`, testKey(1), key, key)
+}
+
+func TestConfigDuplicateMappingKeyKeepsLinesRedactsKey(t *testing.T) {
+	// A duplicate mapping key carries no value to redact, so the operator
+	// keeps both line numbers. The key itself is arbitrary document text
+	// and this fires during decode, before ValidServiceName ever runs, so
+	// the key does not survive.
+	_, err := LoadPeersConfig(tempFile(t, "peers.yaml", dupAllowKeyYAML("primary-db")))
+	if err == nil {
+		t.Fatal("want error for a duplicate mapping key, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{"line 8", "line 7", "mapping key", "already defined"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should retain %q, got: %v", want, err)
+		}
+	}
+	if strings.Contains(msg, "primary-db") {
+		t.Errorf("error echoes the duplicated key: %v", err)
+	}
+}
+
+func TestConfigDuplicateMappingKeyRedactsSecretKey(t *testing.T) {
+	// A secret pasted into a key position must not be echoed.
+	const secret = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY123456"
+	_, err := LoadPeersConfig(tempFile(t, "peers.yaml", dupAllowKeyYAML(secret)))
+	if err == nil {
+		t.Fatal("want error for a duplicate mapping key, got nil")
+	}
+	for n := 3; n <= len(secret); n++ {
+		if strings.Contains(err.Error(), secret[:n]) {
+			t.Fatalf("error leaks the key prefix %q: %v", secret[:n], err)
+		}
+	}
+}
+
+func TestConfigSanitizeYAMLMessageClasses(t *testing.T) {
+	// yaml.v3 appends three message classes into one TypeError. The
+	// already-set class is not reachable through this package's struct
+	// shapes (an identical key is caught as a duplicate mapping key
+	// first, and a differently spelled one is an unknown field), so it is
+	// exercised here directly rather than through a fixture.
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "unknown field kept verbatim",
+			in:   "line 7: field privatekey not found in type gocloak.serverYAML",
+			want: "line 7: field privatekey not found in type gocloak.serverYAML",
+		},
+		{
+			name: "already set kept verbatim",
+			in:   "line 4: field mtu already set in type gocloak.serverYAML",
+			want: "line 4: field mtu already set in type gocloak.serverYAML",
+		},
+		{
+			name: "duplicate key keeps both lines, loses the key",
+			in:   `line 8: mapping key "primary-db" already defined at line 7`,
+			want: "line 8: mapping key (redacted) already defined at line 7",
+		},
+		{
+			name: "duplicate key whose key text mimics another class",
+			in:   `line 8: mapping key "x not found in type y" already defined at line 7`,
+			want: "line 8: mapping key (redacted) already defined at line 7",
+		},
+		{
+			name: "duplicate key whose key text mimics its own suffix",
+			in:   `line 8: mapping key "x already defined at line 1" already defined at line 7`,
+			want: "line 8: mapping key (redacted) already defined at line 7",
+		},
+		{
+			name: "type mismatch redacted",
+			in:   "line 7: cannot unmarshal !!str `wJalrXU...` into int",
+			want: "line 7: value is not valid for this field (value redacted)",
+		},
+		{
+			name: "message with no line prefix still redacted",
+			in:   "cannot unmarshal !!str `wJalrXU...` into int",
+			want: "value is not valid for this field (value redacted)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeYAMLMessage(tc.in); got != tc.want {
+				t.Errorf("sanitizeYAMLMessage(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
