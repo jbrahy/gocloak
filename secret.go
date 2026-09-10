@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -13,9 +14,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
+// SecretRef is a reference to key material, not the key material itself,
+// e.g. "aws:sm:gocloak/server/private" or "env:GOCLOAK_PSK". Config types
+// use SecretRef for secret-bearing fields so the compiler catches a config
+// field accidentally populated with a literal secret value instead of a
+// reference.
+type SecretRef string
+
 // Secret holds resolved key material in memory. It is never written to disk.
-// String returns a redacted placeholder rather than the value, so a stray
-// %v or %s in a future log line cannot leak it.
+// String and GoString return a redacted placeholder rather than the value,
+// so a stray %v, %s, or %#v in a future log line cannot leak it.
 type Secret struct {
 	value []byte
 }
@@ -28,6 +36,12 @@ func (s Secret) Bytes() []byte {
 // String implements fmt.Stringer with a redacted placeholder. It
 // deliberately never returns the resolved value.
 func (s Secret) String() string {
+	return "[REDACTED]"
+}
+
+// GoString implements fmt.GoStringer with the same redacted placeholder as
+// String. Without this, %#v bypasses String and prints the raw bytes.
+func (s Secret) GoString() string {
 	return "[REDACTED]"
 }
 
@@ -68,7 +82,7 @@ func NewSecretResolver(ctx context.Context) (*SecretResolver, error) {
 // are aws:sm:<secret-id>, aws:ssm:<parameter>, file:<path>, and env:<VAR>.
 // An unrecognized scheme is always an error; it is never treated as a
 // literal value.
-func (r *SecretResolver) Resolve(ctx context.Context, ref string) (Secret, error) {
+func (r *SecretResolver) Resolve(ctx context.Context, ref SecretRef) (Secret, error) {
 	scheme, payload, err := parseSecretRef(ref)
 	if err != nil {
 		return Secret{}, err
@@ -91,16 +105,17 @@ func (r *SecretResolver) Resolve(ctx context.Context, ref string) (Secret, error
 // parseSecretRef splits a reference into its scheme and payload, and
 // rejects anything that is not one of the four known schemes. An unknown
 // scheme is always an error, never a fallback to treating ref as a literal.
-func parseSecretRef(ref string) (scheme, payload string, err error) {
+func parseSecretRef(ref SecretRef) (scheme, payload string, err error) {
 	if ref == "" {
 		return "", "", errors.New("secret: empty reference")
 	}
 
-	i := strings.IndexByte(ref, ':')
+	s := string(ref)
+	i := strings.IndexByte(s, ':')
 	if i < 0 {
-		return "", "", fmt.Errorf("secret: reference %q has no scheme", ref)
+		return "", "", fmt.Errorf("secret: reference %q has no scheme", s)
 	}
-	head, rest := ref[:i], ref[i+1:]
+	head, rest := s[:i], s[i+1:]
 
 	switch head {
 	case "aws":
@@ -164,16 +179,24 @@ func (r *SecretResolver) resolveAWSSSM(ctx context.Context, name string) (Secret
 }
 
 // resolveFile resolves a file:<path> reference. It refuses to read a file
-// whose permissions are looser than 0600.
+// whose permissions are looser than 0600. The permission check and the read
+// are done against the same open file handle, so the file cannot be swapped
+// out between the check and the read (TOCTOU).
 func resolveFile(path string) (Secret, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return Secret{}, fmt.Errorf("secret: file:%s: %w", path, err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil {
 		return Secret{}, fmt.Errorf("secret: file:%s: %w", path, err)
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		return Secret{}, fmt.Errorf("secret: file:%s: permissions %#o are looser than 0600", path, info.Mode().Perm())
 	}
-	data, err := os.ReadFile(path)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return Secret{}, fmt.Errorf("secret: file:%s: %w", path, err)
 	}

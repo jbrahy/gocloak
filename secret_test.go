@@ -73,7 +73,7 @@ func TestSecretResolve(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		ref      string
+		ref      SecretRef
 		resolver *SecretResolver
 		want     string
 		wantErr  bool
@@ -82,9 +82,9 @@ func TestSecretResolve(t *testing.T) {
 		{name: "aws sm backend error", ref: "aws:sm:gocloak/server/private", resolver: failing, wantErr: true},
 		{name: "aws ssm success", ref: "aws:ssm:/gocloak/server/private", resolver: working, want: "ssm-secret-value"},
 		{name: "aws ssm backend error", ref: "aws:ssm:/gocloak/server/private", resolver: failing, wantErr: true},
-		{name: "file success", ref: "file:" + okFile, resolver: working, want: "file-secret-value"},
-		{name: "file rejects 0644", ref: "file:" + looseFile, resolver: working, wantErr: true},
-		{name: "file missing", ref: "file:" + missingFile, resolver: working, wantErr: true},
+		{name: "file success", ref: SecretRef("file:" + okFile), resolver: working, want: "file-secret-value"},
+		{name: "file rejects 0644", ref: SecretRef("file:" + looseFile), resolver: working, wantErr: true},
+		{name: "file missing", ref: SecretRef("file:" + missingFile), resolver: working, wantErr: true},
 		{name: "env success", ref: "env:GOCLOAK_TEST_SECRET", resolver: working, want: "env-secret-value"},
 		{name: "env unset", ref: "env:GOCLOAK_TEST_SECRET_UNSET", resolver: working, wantErr: true},
 		{name: "unknown scheme", ref: "ftp:example.com/secret", resolver: working, wantErr: true},
@@ -126,7 +126,7 @@ func TestSecretRejectsLooseFilePermissions(t *testing.T) {
 	}
 
 	r := &SecretResolver{}
-	_, err := r.Resolve(context.Background(), "file:"+loose)
+	_, err := r.Resolve(context.Background(), SecretRef("file:"+loose))
 	if err == nil {
 		t.Fatalf("Resolve of a 0644 file did not error")
 	}
@@ -144,12 +144,36 @@ func TestSecretRejectsUnknownScheme(t *testing.T) {
 }
 
 // TestSecretStringRedacted proves the returned type never renders the
-// resolved value through String/%v, so a future log line using %v cannot
-// leak it.
+// resolved value through %v, %s, or %#v, for both value and pointer
+// receivers, so a future log line or debug struct dump cannot leak it.
+//
+// %#v bypasses String() and, without a GoString() method, would print the
+// raw bytes as a []uint8 literal (e.g. []uint8{0x74, 0x6f, 0x70, ...}) which
+// is a leak even though it does not contain the plaintext substring. So
+// this asserts the exact redacted placeholder, not just the absence of the
+// plaintext, to actually catch that case.
 func TestSecretStringRedacted(t *testing.T) {
+	const want = "[REDACTED]"
 	s := Secret{value: []byte("top-secret-value")}
-	repr := fmt.Sprintf("%v", s)
-	if strings.Contains(repr, "top-secret-value") {
-		t.Fatalf("Secret.String() leaked the resolved value: %q", repr)
+	p := &s
+
+	cases := []struct {
+		name string
+		repr string
+	}{
+		{"value %v", fmt.Sprintf("%v", s)},
+		{"value %s", fmt.Sprintf("%s", s)},
+		{"value %#v", fmt.Sprintf("%#v", s)},
+		{"pointer %v", fmt.Sprintf("%v", p)},
+		{"pointer %s", fmt.Sprintf("%s", p)},
+		{"pointer %#v", fmt.Sprintf("%#v", p)},
+	}
+	for _, tc := range cases {
+		if tc.repr != want {
+			t.Fatalf("%s = %q, want %q (redacted)", tc.name, tc.repr, want)
+		}
+		if strings.Contains(tc.repr, "top-secret-value") {
+			t.Fatalf("%s leaked the resolved value: %q", tc.name, tc.repr)
+		}
 	}
 }
