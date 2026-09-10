@@ -43,6 +43,11 @@ type serverTestPeer struct {
 	IP     netip.Addr
 	Limits PeerLimits
 	Allow  map[string]string
+
+	// PSKMissing makes the peer's psk reference name an environment
+	// variable that is never set, so applying the peer fails on secret
+	// resolution.
+	PSKMissing bool
 }
 
 func serverTestNewPeer(t *testing.T, name, ip string) *serverTestPeer {
@@ -61,7 +66,11 @@ func serverTestNewPeer(t *testing.T, name, ip string) *serverTestPeer {
 // pskRef is the secret reference peers.yaml carries for this peer. It is an
 // env: reference so the whole suite runs with no AWS and no network.
 func (p *serverTestPeer) pskRef() SecretRef {
-	return SecretRef("env:GOCLOAK_TEST_PSK_" + strings.ToUpper(strings.ReplaceAll(p.Name, "-", "_")))
+	name := strings.ToUpper(strings.ReplaceAll(p.Name, "-", "_"))
+	if p.PSKMissing {
+		return SecretRef("env:GOCLOAK_TEST_PSK_NEVER_SET_" + name)
+	}
+	return SecretRef("env:GOCLOAK_TEST_PSK_" + name)
 }
 
 // serverTestWritePeers renders peers.yaml and publishes each PSK under the
@@ -72,7 +81,9 @@ func serverTestWritePeers(t *testing.T, path string, peers []*serverTestPeer) {
 	var b strings.Builder
 	b.WriteString("peers:\n")
 	for _, p := range peers {
-		t.Setenv(strings.TrimPrefix(string(p.pskRef()), "env:"), deviceTestB64(p.PSK))
+		if !p.PSKMissing {
+			t.Setenv(strings.TrimPrefix(string(p.pskRef()), "env:"), deviceTestB64(p.PSK))
+		}
 
 		fmt.Fprintf(&b, "  - name: %s\n", p.Name)
 		fmt.Fprintf(&b, "    public_key: %s\n", p.Pub)
@@ -291,6 +302,31 @@ func serverTestHello(t *testing.T, d *tunnelDevice, service string) (net.Conn, S
 	return c, status
 }
 
+// serverTestHelloUntil retries the hello exchange until the server answers
+// with want, under a bounded budget. It exists because a dial attempt that
+// the client abandoned mid handshake can leave a connection briefly in
+// flight on the server, holding a concurrency slot until the hello deadline
+// closes it. Retrying on a refusal costs nothing (a refused connection takes
+// no slot) and keeps a limit test off the clock.
+func serverTestHelloUntil(t *testing.T, d *tunnelDevice, service string, want Status, budget time.Duration) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	var last Status
+	for {
+		conn, status := serverTestHello(t, d, service)
+		if status == want {
+			return conn
+		}
+		conn.Close()
+		last = status
+		if time.Now().After(deadline) {
+			t.Fatalf("status = %v after %v of retrying, want %v", last, budget, want)
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // serverTestBackend is a real TCP backend on the host network, which is
 // where a real backend lives: the server dials it outside the tunnel.
 type serverTestBackend struct {
@@ -486,6 +522,9 @@ func TestServerBackendUnavailableIsDistinctFromDenied(t *testing.T) {
 // rejects gets 0x04 and a close, rather than silence.
 func TestServerMalformedHelloFrameIsAnswered(t *testing.T) {
 	peer := serverTestNewPeer(t, "app-01", "10.99.0.7")
+	// The limiter runs before the hello read, so the peer needs budget to
+	// reach the parser at all.
+	peer.Limits = PeerLimits{MaxConcurrent: 8, DialsPerSecond: 8}
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
@@ -550,16 +589,74 @@ func TestServerMaxConcurrentIsEnforced(t *testing.T) {
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
-	first, status := serverTestHello(t, client, "primary-db")
-	if status != StatusOK {
-		t.Fatalf("first status = %v, want ok", status)
-	}
+	first := serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second)
 	defer first.Close()
 
-	_, status = serverTestHello(t, client, "primary-db")
-	if status != StatusRateLimited {
+	if _, status := serverTestHello(t, client, "primary-db"); status != StatusRateLimited {
 		t.Fatalf("second status = %v, want rate limited", status)
 	}
+}
+
+// TestServerMaxConcurrentBoundsConnectionsThatSendNothing is the property
+// the cap exists for. Every accepted connection costs a goroutine, a
+// netstack connection and a file descriptor from the moment it is accepted,
+// and a peer that says nothing holds all of that for the whole hello
+// deadline. So the cap has to be applied before the hello read: if it were
+// applied after, a peer could hold an unbounded number of connections in
+// flight and starve every other peer, and max_concurrent would bound
+// nothing at all.
+func TestServerMaxConcurrentBoundsConnectionsThatSendNothing(t *testing.T) {
+	const maxConcurrent = 3
+
+	backend := serverTestNewBackend(t, serverTestEcho)
+
+	peer := serverTestNewPeer(t, "app-01", "10.99.0.7")
+	peer.Allow["primary-db"] = backend.String()
+	peer.Limits = PeerLimits{MaxConcurrent: maxConcurrent, DialsPerSecond: 100}
+
+	h := serverTestStart(t, peer)
+	client := h.client(peer)
+
+	// Warm the tunnel up with a completed exchange, so the dials below
+	// are immediate and the handshake is not part of the timing.
+	serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second).Close()
+
+	// Open the cap's worth of connections that send nothing at all. Each
+	// one sits on the hello deadline, which is five seconds, so they are
+	// all still in flight for the assertion below.
+	silent := make([]net.Conn, 0, maxConcurrent)
+	for i := 0; i < maxConcurrent; i++ {
+		silent = append(silent, serverTestConnect(t, client))
+	}
+	defer func() {
+		for _, c := range silent {
+			c.Close()
+		}
+	}()
+
+	// One more connection, this one asking for a service it is granted.
+	// The slots are all held by peers that have said nothing, so it must
+	// be refused rather than served.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		conn, status := serverTestHello(t, client, "primary-db")
+		conn.Close()
+		if status == StatusRateLimited {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connection %d status = %v, want rate limited: %d silent connections are in flight against a cap of %d, so the cap is bounding nothing",
+				maxConcurrent+1, status, maxConcurrent, maxConcurrent)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Closing the silent connections frees their slots, so the cap is a
+	// cap and not a permanent lockout.
+	for _, c := range silent {
+		c.Close()
+	}
+	serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second).Close()
 }
 
 // TestServerDialsPerSecondIsEnforced sets a bucket of one dial per second
@@ -579,18 +676,17 @@ func TestServerDialsPerSecondIsEnforced(t *testing.T) {
 	// take milliseconds, so the bucket cannot refill in the middle of
 	// them, but asserting on the burst rather than on one exact attempt
 	// keeps the test off the clock.
+	serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second).Close()
+
 	var statuses []Status
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 3; i++ {
 		conn, status := serverTestHello(t, client, "primary-db")
 		conn.Close()
 		statuses = append(statuses, status)
 	}
 
-	if statuses[0] != StatusOK {
-		t.Fatalf("first status = %v, want ok", statuses[0])
-	}
 	limited := 0
-	for _, st := range statuses[1:] {
+	for _, st := range statuses {
 		if st == StatusRateLimited {
 			limited++
 		}
@@ -617,10 +713,7 @@ func TestServerRateLimitIsCheckedBeforePolicy(t *testing.T) {
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
-	first, status := serverTestHello(t, client, "primary-db")
-	if status != StatusOK {
-		t.Fatalf("first status = %v, want ok", status)
-	}
+	first := serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second)
 	defer first.Close()
 
 	if _, status := serverTestHello(t, client, "not-granted"); status != StatusRateLimited {
@@ -1049,6 +1142,53 @@ func TestServerUnknownTunnelIPLogsAsLiteralUnknown(t *testing.T) {
 	}
 }
 
+// TestServerScrubRefRedactsPayloadAndKeepsUnwrap covers the scrubbing that
+// keeps a secret reference out of a log line. secret.go wraps the
+// underlying os and AWS errors, which repeat the bare path or id without
+// the scheme prefix, so scrubbing only the whole reference would leave the
+// path in the message.
+func TestServerScrubRefRedactsPayloadAndKeepsUnwrap(t *testing.T) {
+	if got := scrubRef(nil, "env:X"); got != nil {
+		t.Fatalf("scrubRef(nil) = %v, want nil", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "psk-that-does-not-exist")
+	ref := SecretRef("file:" + path)
+
+	resolver := &SecretResolver{}
+	_, err := resolver.Resolve(context.Background(), ref)
+	if err == nil {
+		t.Fatal("resolving a missing file succeeded, want an error")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("test bug: the unscrubbed error %q does not contain the path, so the assertion below is vacuous", err)
+	}
+
+	scrubbed := scrubRef(err, ref)
+	if strings.Contains(scrubbed.Error(), path) {
+		t.Fatalf("scrubbed error still contains the path: %v", scrubbed)
+	}
+	if strings.Contains(scrubbed.Error(), string(ref)) {
+		t.Fatalf("scrubbed error still contains the reference: %v", scrubbed)
+	}
+	if !strings.Contains(scrubbed.Error(), redactedRefPlaceholder) {
+		t.Fatalf("scrubbed error = %q, want it to carry %q", scrubbed, redactedRefPlaceholder)
+	}
+	if !errors.Is(scrubbed, os.ErrNotExist) {
+		t.Fatalf("errors.Is(scrubbed, os.ErrNotExist) = false: scrubbing must not break the error chain")
+	}
+
+	// An env reference, whose payload is the whole tail of the reference.
+	envRef := SecretRef("env:GOCLOAK_TEST_REF_NEVER_SET")
+	_, enverr := resolver.Resolve(context.Background(), envRef)
+	if enverr == nil {
+		t.Fatal("resolving an unset variable succeeded, want an error")
+	}
+	if got := scrubRef(enverr, envRef); strings.Contains(got.Error(), "GOCLOAK_TEST_REF_NEVER_SET") {
+		t.Fatalf("scrubbed error still names the variable: %v", got)
+	}
+}
+
 // TestServerLogsNeverContainKeyMaterial runs a full connection lifecycle
 // with a capturing logger and asserts constraint 4 holds across all of it:
 // no private key, no PSK, no secret reference, no public key, no payload.
@@ -1063,8 +1203,10 @@ func TestServerLogsNeverContainKeyMaterial(t *testing.T) {
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
-	// A granted connection with real bytes, a denial, and a malformed
-	// frame: the whole lifecycle, all of it logged.
+	// The whole lifecycle, all of it logged: a granted connection with
+	// real bytes, a denial, a malformed frame, a reload, and a reload
+	// whose peer PSK cannot be resolved, which is the one path that puts
+	// a scrubbed secret reference into a log line.
 	conn, status := serverTestHello(t, client, "primary-db")
 	if status != StatusOK {
 		t.Fatalf("status = %v, want ok", status)
@@ -1085,10 +1227,40 @@ func TestServerLogsNeverContainKeyMaterial(t *testing.T) {
 		t.Fatalf("denied status = %v, want denied", status)
 	}
 
-	// Force a reload too, so the reload log lines are in the capture.
-	serverTestWritePeers(t, h.peersPath, []*serverTestPeer{peer})
-	if got := h.awaitReload(); got.res.Err != nil {
+	// A malformed frame, which is logged with its own status.
+	malformed := serverTestConnect(t, client)
+	if _, err := malformed.Write([]byte{0x02, 0x01, 'x'}); err != nil {
+		t.Fatalf("write malformed frame: %v", err)
+	}
+	if err := malformed.SetReadDeadline(time.Now().Add(serverTestDialBudget)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	var resp [2]byte
+	if _, err := io.ReadFull(malformed, resp[:]); err != nil {
+		t.Fatalf("read malformed response: %v", err)
+	}
+	if Status(resp[1]) != StatusMalformed {
+		t.Fatalf("malformed status = %v, want malformed", Status(resp[1]))
+	}
+	malformed.Close()
+
+	// A reload that adds a peer whose PSK reference resolves to nothing.
+	// Applying it fails, and the failure is logged with the error from
+	// the secret resolver, which is where a reference would leak if it
+	// were not scrubbed.
+	broken := serverTestNewPeer(t, "app-02", "10.99.0.8")
+	broken.PSKMissing = true
+	serverTestWritePeers(t, h.peersPath, []*serverTestPeer{peer, broken})
+
+	got := h.awaitReload()
+	if got.res.Err != nil {
 		t.Fatalf("reload error: %v", got.res.Err)
+	}
+	if got.err == nil {
+		t.Fatal("applying a peer whose PSK cannot be resolved reported success, want an error")
+	}
+	if strings.Contains(got.err.Error(), string(broken.pskRef())) {
+		t.Fatalf("the apply error echoes the secret reference: %v", got.err)
 	}
 
 	logs := h.logs.String()
@@ -1105,6 +1277,8 @@ func TestServerLogsNeverContainKeyMaterial(t *testing.T) {
 		"peer psk reference":    string(peer.pskRef()),
 		"private key reference": "env:GOCLOAK_TEST_SERVER_PRIV",
 		"payload":               payload,
+		"broken psk reference":  string(broken.pskRef()),
+		"broken psk payload":    strings.TrimPrefix(string(broken.pskRef()), "env:"),
 	}
 	for what, secret := range forbidden {
 		if secret == "" {
@@ -1115,8 +1289,10 @@ func TestServerLogsNeverContainKeyMaterial(t *testing.T) {
 		}
 	}
 
-	// The fields that must be there.
-	for _, want := range []string{"app-01", "primary-db", "bytes_sent", "bytes_received", "duration_ms"} {
+	// The fields that must be there, including the scrubbed placeholder,
+	// which proves the failing apply really did reach a log line.
+	for _, want := range []string{"app-01", "app-02", "primary-db", "bytes_sent", "bytes_received", "duration_ms",
+		StatusMalformed.String(), redactedRefPlaceholder} {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("logs do not contain %q; logs:\n%s", want, logs)
 		}

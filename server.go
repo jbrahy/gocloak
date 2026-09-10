@@ -328,6 +328,38 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 	peer := s.peerName(peerIP)
 
+	// Limits are applied before the hello frame is read, not just before
+	// the policy is consulted. The connection already costs a goroutine, a
+	// netstack connection and a file descriptor by the time it is
+	// accepted, and the hello read can sit on its deadline for five
+	// seconds. Checking after that read would let a peer that connects and
+	// says nothing hold an unbounded number of connections in flight, so
+	// max_concurrent would bound nothing and one peer could starve every
+	// other, which is precisely the abuse spec 8.2 names the cap for.
+	//
+	// The service name is not known here, so the two refusal lines below
+	// carry no service field. That is the correct trade: the cap must be
+	// applied at the moment the resource is committed.
+	limiter, known := s.limiterFor(peerIP)
+	if !known {
+		// The peer's tunnel address is not in the peer list currently
+		// in force. Cryptokey routing should already have dropped its
+		// packets; reaching here means the peer was revoked mid
+		// connection. Deny.
+		_ = s.respond(conn, StatusDenied)
+		s.logger.Warn("gocloak: connection from an address with no peer entry",
+			"peer", peer, "status", StatusDenied.String(), "duration_ms", millis(start))
+		return
+	}
+	if reason, allowed := limiter.acquire(time.Now()); !allowed {
+		_ = s.respond(conn, StatusRateLimited)
+		s.logger.Warn("gocloak: rate limited",
+			"peer", peer, "status", StatusRateLimited.String(),
+			"limit", reason, "duration_ms", millis(start))
+		return
+	}
+	defer limiter.release()
+
 	if err := conn.SetReadDeadline(time.Now().Add(HelloReadDeadline)); err != nil {
 		s.logger.Error("gocloak: could not set the hello read deadline", "peer", peer, "error", err.Error())
 		return
@@ -350,28 +382,8 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Rate limits are applied before the policy is consulted, so a peer
-	// cannot use denied lookups as a free hammer.
-	limiter, known := s.limiterFor(peerIP)
-	if !known {
-		// The peer's tunnel address is not in the peer list currently
-		// in force. Cryptokey routing should already have dropped its
-		// packets; reaching here means the peer was revoked mid
-		// connection. Deny.
-		_ = s.respond(conn, StatusDenied)
-		s.logger.Warn("gocloak: connection from an address with no peer entry",
-			"peer", peer, "service", service, "status", StatusDenied.String(), "duration_ms", millis(start))
-		return
-	}
-	if reason, allowed := limiter.acquire(time.Now()); !allowed {
-		_ = s.respond(conn, StatusRateLimited)
-		s.logger.Warn("gocloak: rate limited",
-			"peer", peer, "service", service, "status", StatusRateLimited.String(),
-			"limit", reason, "duration_ms", millis(start))
-		return
-	}
-	defer limiter.release()
-
+	// The limiter already ran, above the hello read, so a peer cannot use
+	// denied lookups as a free hammer either.
 	backend, granted := s.watcher.Policy().Resolve(peerIP, service)
 	if !granted {
 		_ = s.respond(conn, StatusDenied)
@@ -529,6 +541,14 @@ func (s *Server) refreshPeers(cfg *PeersConfig) {
 		ip := p.TunnelIP.Unmap()
 		names[ip] = p.Name
 		if l, ok := s.limiters[ip]; ok {
+			// Limiters are keyed by tunnel address, not by public key,
+			// so if one reload removes a peer and adds a different one
+			// at the same address, the new peer inherits the old one's
+			// live concurrency count and its partly spent bucket. That
+			// is deliberate: the count reflects connections that are
+			// still open on this device at that address, and the
+			// stricter reading is the fail-closed one. The inherited
+			// count drains as those connections close.
 			l.setLimits(p.Limits)
 			limiters[ip] = l
 			continue
@@ -695,16 +715,41 @@ func (s *Server) pruneSecretCache() {
 	}
 }
 
+// redactedError carries a scrubbed message while keeping the original error
+// reachable, so errors.Is and errors.As still work on a scrubbed error.
+// Only Error() is redacted; a caller that unwraps deliberately gets the
+// original, and a caller that formats or logs gets the scrubbed text.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
 // scrubRef removes a secret reference from an error message. A reference is
 // not key material, but constraint 4 keeps it out of logs, and this error
 // is on its way to one.
+//
+// Both the whole reference and its payload are removed. secret.go wraps the
+// underlying os and AWS errors, which repeat the bare path or id without
+// the scheme prefix, so scrubbing only the full reference would leave
+// "secret: [REDACTED REF]: open /etc/psk: permission denied" with the path
+// still in it. Over-redaction is the acceptable direction here: a garbled
+// error is a smaller problem than a leaked one.
 func scrubRef(err error, ref SecretRef) error {
 	if err == nil {
 		return nil
 	}
-	msg := strings.ReplaceAll(err.Error(), string(ref), "[REDACTED REF]")
-	return errors.New(msg)
+	msg := strings.ReplaceAll(err.Error(), string(ref), redactedRefPlaceholder)
+	if _, payload, perr := parseSecretRef(ref); perr == nil && payload != "" {
+		msg = strings.ReplaceAll(msg, payload, redactedRefPlaceholder)
+	}
+	return &redactedError{msg: msg, err: err}
 }
+
+// redactedRefPlaceholder is what a scrubbed reference reads as in a log.
+const redactedRefPlaceholder = "[REDACTED REF]"
 
 // ---------------------------------------------------------------------------
 // per-peer limits
