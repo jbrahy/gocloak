@@ -327,3 +327,147 @@ in `package gocloak_test` and touches the library only through the public API,
 so a passing `Example` is the proof that the surviving 47 identifiers are still
 enough to build, configure, run and use a tunnel. It needed no edit at all,
 which is the other half of that proof.
+
+# Follow-up: the shutdown ordering data race
+
+Date: 2026-09-11
+Branch: `harden/close-residuals`, same branch as the work above.
+
+## What was wrong
+
+`Run` registered its defers so that shutdown ran in this order:
+
+```
+cancel -> watcher goroutine wait -> ln.Close -> dev.Close -> s.wg.Wait -> watcher.Close
+```
+
+The device was closed before the connection handlers were waited for. While a
+handler was still unwinding, gVisor's TCP stack was still emitting packets for
+the connections that handler was closing, resets among them.
+`netstack.(*netTun).Close()` drains the channel `netstack.(*netTun).WriteNotify()`
+sends on, so the two race. Observed once under `-race` on this branch, in
+`TestServerMaxConcurrentIsEnforced`:
+
+```
+WARNING: DATA RACE
+Write at ... by goroutine 4760:
+  netstack.(*netTun).Close()   tun.go:180
+  device.(*Device).Close()     device.go:381
+  gocloak.(*tunnelDevice).Close.1()   device.go:280
+Previous read at ... by goroutine 4821:
+  netstack.(*netTun).WriteNotify()   tun.go:166
+  ... gvisor tcp.replyWithReset ...
+```
+
+Frequency on this branch before the fix: 1 race in 4 full `-race` suite runs.
+On `main`, before the residual hardening: 0 in 4. The hardening did not create
+the ordering bug. It made it reachable more often, because reaping a revoked
+peer's connections produces more resets near shutdown.
+
+## The new order
+
+```
+cancel -> watcher goroutine wait -> ln.Close -> close every tracked live
+connection -> s.wg.Wait (bounded) -> dev.Close -> watcher.Close
+```
+
+`server.go`, `Run`. The three middle steps are one new deferred call,
+`s.drainConnections(ln)`, registered after the device's `Close` so it runs
+before it. `defer s.wg.Wait()` is gone from the top of `Run`; the wait now
+lives inside the drain, where it is correctly ordered against both the close
+of the live connections and the close of the device.
+
+`watcher.Close()` stays last, registered first. A handler unwinding during the
+drain still reads the policy through `s.watcher`, and `Close` only releases the
+filesystem watch, so closing it earlier would gain nothing and could take a
+live reader's config out from under it. The watcher's own goroutine is a
+separate thing and is still waited for before any of this, which is what keeps
+a reload from ever applying a peer to a closed device.
+
+## Why this cannot hang
+
+Closing the live connections is the step that makes the earlier wait safe.
+Moving `wg.Wait` ahead of `dev.Close` without it would turn a rare race into a
+reliable deadlock: a handler parked in `io.Copy` on a tunnel connection that
+never errors on its own would hold shutdown forever. So `drainConnections`
+closes both sides of every connection tracked by every peer limiter in force,
+using the per-peer live sets the residual work added. A peer that has left the
+list has already been reaped by `refreshPeers`, and a handler that registered
+against a limiter no longer in force closes its own connection on the re-check
+in `handleConn`, so between the three of them every tracked connection is
+covered.
+
+The gap that accounting cannot close is the window between `Accept` and
+`limiter.track`. A connection in that window is in no live set, so closing the
+live sets does not touch it. Every step in that window is separately bounded:
+the hello read deadline is 5s, the backend dial timeout is 10s, the response
+write deadline is 5s, and `runCtx` is already cancelled by the time the drain
+runs, which collapses the dial to nothing. Worst case is therefore about 20s
+and in practice immediate.
+
+Rather than trust that argument, the wait is bounded anyway.
+`shutdownDrainTimeout` is 30s, comfortably above the 20s worst case. If it
+fires, shutdown logs an error naming the timeout and proceeds to close the
+device with a straggler still running, which is exactly what this code did on
+every single shutdown before this change. That fallback is strictly better
+than today's behaviour and strictly better than a shutdown that can block
+forever. It is expected to be dead code.
+
+Two log lines were added, both at the shutdown boundary:
+`gocloak: shutdown: every connection handler has returned` and
+`gocloak: shutdown: closing the tunnel device`. The order is load bearing and
+the log is the only place it is visible from outside the package, which is
+what the end-to-end test asserts on.
+
+## Tests
+
+`TestServerShutdownWithLiveConnectionsClosesTheDeviceLast` brings up two peers,
+opens a real proxied connection for each through a real WireGuard pair, proves
+each one carries bytes, then parks both with no traffic and no deadlines, which
+is where a handler spends a long session. It cancels the server and asserts
+that `Run` returns nil within 30s, that both handlers logged their closing line
+before the device close line, and that the bounded wait never fired.
+
+What it proves: shutdown with live connections in flight returns promptly and
+without error, every handler had returned before the device was closed, and
+the explicit close is what freed them rather than the timeout. Reverting the
+ordering so the device closes first fails it deterministically, verified by
+doing exactly that: 3 runs, 3 failures, on the assertion that the device was
+closed before the handler wait finished.
+
+What it does not prove: that the data race is gone. The race is intermittent
+and a passing `-race` run is weak evidence for its absence. The test asserts
+the ordering invariant that makes the race impossible, which is the stronger
+thing available here, but it cannot observe the race itself.
+
+`TestServerDrainClosesLiveConnectionsBeforeWaiting` is the deterministic half.
+The end-to-end test cannot fail reliably if the explicit close is dropped,
+because `pipeConns` has its own context watchdog that frees a parked copy when
+`runCtx` is cancelled. So this one parks a stand-in handler on a tracked
+connection with no watchdog at all: the only thing that can free it is
+`drainConnections` closing that connection. Verified by deleting the
+`closeLiveConns` call, which makes the test run to its bound and fail.
+
+No test was weakened, skipped or deleted. No dependency was added. None of the
+residual hardening was reverted; this fix is built on the per-peer live sets it
+introduced.
+
+## Verification
+
+All run in the foreground on this branch, after every change above.
+
+```
+go build ./...                        exit 0
+go vet ./...                          exit 0
+staticcheck ./...                     exit 0
+gofmt -l .                            empty
+go test -count=1 -race ./... run 1    0 races, ok 186.132s / ok 1.780s
+go test -count=1 -race ./... run 2    0 races, ok 201.508s / ok 1.999s
+go test -count=1 -race ./... run 3    0 races, ok 192.821s / ok 2.574s
+go test -run '^Example$' -v .         --- PASS: Example (5.15s)
+```
+
+Three full `-race` suite runs, zero races in each. Against a pre-fix frequency
+of 1 in 4 runs, three clean runs is consistent with the fix and is not proof of
+it: the expected number of races in three runs was under one to begin with.
+The ordering assertion in the tests, not the race count, is the durable part.

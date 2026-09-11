@@ -1803,3 +1803,193 @@ func TestServerRunIsSingleUse(t *testing.T) {
 		t.Fatal("a second Run returned nil, want an error")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// shutdown ordering
+// ---------------------------------------------------------------------------
+
+// serverTestLogLineIndex returns the offset of the first log line containing
+// every one of want, or -1. The offset is what the ordering assertions
+// compare: the log is written by one goroutine per event, but the shutdown
+// sequence itself is a single goroutine, so a line written later in that
+// sequence can only appear later in the log.
+func serverTestLogLineIndex(logs string, want ...string) int {
+	offset := 0
+	for _, line := range strings.Split(logs, "\n") {
+		hit := strings.TrimSpace(line) != ""
+		for _, w := range want {
+			if !strings.Contains(line, w) {
+				hit = false
+				break
+			}
+		}
+		if hit {
+			return offset
+		}
+		offset += len(line) + 1
+	}
+	return -1
+}
+
+// TestServerShutdownWithLiveConnectionsClosesTheDeviceLast is the ordering
+// regression guard. It puts real proxied connections in flight, parks them
+// with no traffic in either direction, which is where a handler spends a
+// long session, and then cancels the server.
+//
+// What it asserts: Run returns promptly and with no error, every handler
+// unwound before the tunnel device was closed, and the bounded wait in
+// drainConnections never had to fire. The device close happening after the
+// last handler's line is the property the data race needed: netstack's
+// Close must not run while the stack is still emitting packets for
+// connections those handlers are closing.
+func TestServerShutdownWithLiveConnectionsClosesTheDeviceLast(t *testing.T) {
+	// The backend answers one ping, so each connection is provably a
+	// working proxy, and then goes quiet and stays quiet, so both copies
+	// in pipeConns are parked when shutdown starts.
+	backend := serverTestNewBackend(t, func(c net.Conn) {
+		defer c.Close()
+		buf := make([]byte, 4)
+		if _, err := readFullConn(c, buf); err != nil {
+			return
+		}
+		if _, err := c.Write(buf); err != nil {
+			return
+		}
+		io.Copy(io.Discard, c)
+	})
+
+	first := serverTestNewPeer(t, "app-first", "10.99.0.7")
+	first.Allow["db"] = backend.String()
+	second := serverTestNewPeer(t, "app-second", "10.99.0.8")
+	second.Allow["db"] = backend.String()
+
+	h := serverTestStart(t, first, second)
+
+	for _, p := range []*serverTestPeer{first, second} {
+		conn, status := serverTestHello(t, h.client(p), "db")
+		if status != statusOK {
+			t.Fatalf("%s: status = %v, want ok", p.Name, status)
+		}
+		if err := conn.SetDeadline(time.Now().Add(serverTestDialBudget)); err != nil {
+			t.Fatalf("%s: set deadline: %v", p.Name, err)
+		}
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatalf("%s: write to backend: %v", p.Name, err)
+		}
+		buf := make([]byte, 4)
+		if _, err := readFullConn(conn, buf); err != nil {
+			t.Fatalf("%s: read from backend: %v", p.Name, err)
+		}
+		if string(buf) != "ping" {
+			t.Fatalf("%s: backend echoed %q, want %q", p.Name, buf, "ping")
+		}
+		// Cleared, so nothing but the shutdown can end this session.
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			t.Fatalf("%s: clear deadline: %v", p.Name, err)
+		}
+	}
+
+	// Both connections are now live, idle and deadline-free. Shut down.
+	h.cancel()
+	if err := h.waitRun(30 * time.Second); err != nil {
+		t.Fatalf("Run returned %v with live connections in flight, want nil", err)
+	}
+
+	logs := h.logs.String()
+
+	device := serverTestLogLineIndex(logs, `"gocloak: shutdown: closing the tunnel device"`)
+	if device < 0 {
+		t.Fatalf("shutdown never logged that it was closing the device; logs:\n%s", logs)
+	}
+	drained := serverTestLogLineIndex(logs, `"gocloak: shutdown: every connection handler has returned"`)
+	if drained < 0 {
+		t.Fatalf("shutdown never logged that the handlers had returned, so the wait did not complete; logs:\n%s", logs)
+	}
+	if drained > device {
+		t.Fatalf("the device was closed before the handler wait finished; logs:\n%s", logs)
+	}
+	if i := serverTestLogLineIndex(logs, `"gocloak: connection handlers did not finish`); i >= 0 {
+		t.Fatalf("shutdown fell back to its bounded wait, so closing the live connections did not free the handlers; logs:\n%s", logs)
+	}
+
+	// Each handler logs its closing line before its own wg.Done runs, so
+	// a line that appears after the device line means Run closed the
+	// device with that handler still unwinding.
+	for _, p := range []*serverTestPeer{first, second} {
+		i := serverTestLogLineIndex(logs, `"gocloak: connection closed"`, `"peer":"`+p.Name+`"`)
+		if i < 0 {
+			t.Fatalf("%s: the handler never logged that its connection closed; logs:\n%s", p.Name, logs)
+		}
+		if i > device {
+			t.Fatalf("%s: the handler was still unwinding when the device was closed; logs:\n%s", p.Name, logs)
+		}
+	}
+}
+
+// TestServerDrainClosesLiveConnectionsBeforeWaiting is the deterministic
+// half of the guard. The end-to-end test above cannot fail reliably if the
+// explicit close is dropped, because pipeConns has its own context watchdog
+// that frees a parked copy when Run's context is cancelled. This one parks a
+// stand-in handler on a connection with no watchdog at all, so the only
+// thing that can free it is drainConnections closing the tracked connection.
+//
+// Drop the closeLiveConns call and this test stops finishing: the wait runs
+// to its bound and the timeout below fails the test.
+func TestServerDrainClosesLiveConnectionsBeforeWaiting(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	logs := &serverTestLog{}
+	s := &Server{
+		logger:    slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		peerNames: map[netip.Addr]string{},
+		limiters:  map[netip.Addr]*peerLimiter{},
+	}
+	limiter := newPeerLimiter("test-public-key", peerLimits{MaxConcurrent: 4, DialsPerSecond: 4})
+	s.limiters[netip.MustParseAddr("10.99.0.7")] = limiter
+
+	peerConn, peerFar := net.Pipe()
+	backendConn, backendFar := net.Pipe()
+	defer peerFar.Close()
+	defer backendFar.Close()
+
+	live := &liveConn{peerConn: peerConn, backendConn: backendConn}
+	limiter.track(live)
+
+	// A stand-in handler, parked exactly where a real one parks: a read
+	// that returns only when the connection is closed.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		io.Copy(io.Discard, peerConn)
+		limiter.untrack(live)
+	}()
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		s.drainConnections(ln)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownDrainTimeout / 2):
+		t.Fatalf("drainConnections did not return within %v: the parked handler was never freed", shutdownDrainTimeout/2)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("drainConnections took %v, which means it waited rather than closing the connection", elapsed)
+	}
+	if i := serverTestLogLineIndex(logs.String(), `"gocloak: connection handlers did not finish`); i >= 0 {
+		t.Fatalf("drainConnections fell back to its bounded wait; logs:\n%s", logs.String())
+	}
+	if _, err := ln.Accept(); err == nil {
+		t.Fatal("the listener was still accepting after drainConnections returned")
+	}
+	if _, err := backendConn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the backend side of the tracked connection was left open")
+	}
+}

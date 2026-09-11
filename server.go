@@ -25,6 +25,17 @@ const tunnelServicePort = 443
 // operating system gave up, which is minutes.
 const backendDialTimeout = 10 * time.Second
 
+// shutdownDrainTimeout bounds how long shutdown waits for connection
+// handlers to return after every live connection has been closed. It is a
+// backstop, not a schedule: with the listener closed and every tracked
+// connection closed, the longest any handler can still be parked is one
+// hello read deadline plus one backend dial plus one response write
+// deadline, which is 20 seconds today, and a cancelled context collapses
+// the dial to nothing. The wait is bounded anyway because a shutdown that
+// can hang forever is worse than a shutdown that gives up and closes the
+// device with a handler still running.
+const shutdownDrainTimeout = 30 * time.Second
+
 // secretResolveTimeout bounds one secret store lookup during a hot reload.
 // The reload runs in the watcher's goroutine, so an unbounded lookup would
 // stall every later reload, and revocation with it.
@@ -208,12 +219,11 @@ func (s *Server) Run(ctx context.Context) (err error) {
 		return werr
 	}
 	s.watcher = watcher
+	// Registered first so it runs last. A handler unwinding after the
+	// drain below still reads the policy through s.watcher, and Close
+	// only releases the filesystem watch, so there is nothing to gain by
+	// closing it earlier and a reader to lose by doing so.
 	defer watcher.Close()
-
-	// Registered before the device so it runs after the device is closed:
-	// closing the device breaks every live connection, which is what lets
-	// the in-flight handlers finish.
-	defer s.wg.Wait()
 
 	dev, derr := newTunnelDevice(deviceOptions{
 		TunnelIP:   s.cfg.TunnelIP,
@@ -229,7 +239,21 @@ func (s *Server) Run(ctx context.Context) (err error) {
 		return derr
 	}
 	s.dev = dev
-	defer dev.Close()
+	// Registered before the drain below so it runs after it: every
+	// handler goroutine has returned by the time the device is closed.
+	// The device must not be closed while a handler is still unwinding,
+	// because netstack is still emitting packets for the connections
+	// those handlers are closing, and netstack's Close races its own
+	// write notification with them.
+	//
+	// The line is logged, not silent, because the order is load bearing
+	// and the log is the only place it shows from outside: every
+	// handler's own closing line has to be written already when this one
+	// is.
+	defer func() {
+		s.logger.Info("gocloak: shutdown: closing the tunnel device")
+		dev.Close()
+	}()
 
 	// Apply the initial peer list. A peer that cannot be applied stops
 	// startup: a server that came up missing a peer, or with a peer that
@@ -246,7 +270,11 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	if lerr != nil {
 		return fmt.Errorf("gocloak: server: listen on %s:%d: %w", s.cfg.TunnelIP, tunnelServicePort, lerr)
 	}
-	defer ln.Close()
+	// Registered after the device's Close so it runs before it. This is
+	// the whole shutdown ordering: stop accepting, close everything still
+	// proxying, wait for every handler to return, and only then let the
+	// device's Close run.
+	defer s.drainConnections(ln)
 
 	runCtx, cancel := context.WithCancel(ctx)
 
@@ -577,6 +605,77 @@ func (s *Server) limiterFor(ip netip.Addr) (*peerLimiter, bool) {
 	defer s.mu.Unlock()
 	l, ok := s.limiters[ip.Unmap()]
 	return l, ok
+}
+
+// drainConnections shuts the serving path down in the one order that is
+// safe: close the listener so nothing new is accepted, close every
+// connection still proxying so no handler stays parked in io.Copy, then
+// wait for every handler goroutine to return. Run defers it so that it
+// completes before the device is closed.
+//
+// The order is the fix for a real data race. Closing the device first,
+// which is what this used to rely on to break parked handlers, meant
+// netstack's Close ran while the stack was still emitting packets for
+// connections those handlers were closing, including resets, and
+// netstack's Close and its write notification race.
+//
+// Closing the tracked connections is not optional. Waiting first and
+// closing later would turn a rare race into a reliable hang the moment a
+// handler sat in io.Copy on a connection that never errored on its own.
+//
+// The wait is bounded because no accounting can prove the set of tracked
+// connections is the set of places a handler can be parked. The gap is the
+// window between accept and track: a connection that has been accepted but
+// has not reached limiter.track yet is in no live set, so closing the live
+// sets does not touch it. Every step in that window is separately bounded,
+// by the hello read deadline, by the backend dial timeout and by the
+// response write deadline, and Run's context is already cancelled by the
+// time this runs, which collapses the dial. So the wait is expected to be
+// immediate and the bound is expected to be dead code. If it ever fires,
+// shutdown proceeds and says so, because closing the device under a
+// straggler is the behaviour this code had on every shutdown before, and a
+// shutdown that blocks forever is worse.
+func (s *Server) drainConnections(ln net.Listener) {
+	ln.Close()
+	s.closeLiveConns()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(shutdownDrainTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		s.logger.Info("gocloak: shutdown: every connection handler has returned")
+	case <-timer.C:
+		s.logger.Error("gocloak: connection handlers did not finish before shutdown gave up waiting, closing the device anyway",
+			"timeout_ms", shutdownDrainTimeout.Milliseconds())
+	}
+}
+
+// closeLiveConns closes both sides of every connection still proxying, for
+// every peer in the peer list now in force. A peer that has left the list
+// has already had its connections closed by refreshPeers, and a handler
+// that registered against a limiter no longer in force closes its own
+// connection on the re-check in handleConn, so between the three of them
+// every tracked connection is covered.
+func (s *Server) closeLiveConns() {
+	s.mu.Lock()
+	limiters := make([]*peerLimiter, 0, len(s.limiters))
+	for _, l := range s.limiters {
+		limiters = append(limiters, l)
+	}
+	s.mu.Unlock()
+
+	// Closing outside s.mu, for the same reason refreshPeers does: each
+	// close wakes the handler that owns that connection, and that handler
+	// takes locks on its way out.
+	for _, l := range limiters {
+		l.closeLive()
+	}
 }
 
 // refreshPeers rebuilds the name map and the limiter set from the peer list
