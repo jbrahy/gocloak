@@ -101,6 +101,10 @@ recording or CI job log, and in shell history if you pipe or re-echo it. Move
 it into your secret store and clear the scrollback rather than leaving it
 sitting in a window.
 
+Once the private key and PSK are loaded into your secret store, delete the
+`.key` and `.psk` files. They are the only key material this tool puts at rest,
+and the property table below holds only once they are gone.
+
 The peer's `public_key` goes into `peers.yaml` verbatim. The peer's PSK goes
 into your secret store, and `peers.yaml` carries a reference to it, not the
 value. The peer's own `.key` and `.psk` files go to the peer host. The server's
@@ -231,7 +235,7 @@ server and client and backend, in one process.
 | Post-quantum hedge | The PSK is mixed into the chaining key. Breaking Curve25519, including harvest-now-decrypt-later, still leaves a 32-byte symmetric secret. |
 | Anti-DoS | Under load the server returns a cookie MAC'd to the source address instead of performing Curve25519. Address validation precedes expensive work. |
 | Blast radius | A stolen client key reaches only that peer's named services. It cannot express an unapproved address, so it cannot scan or pivot. |
-| No key material at rest | Secrets Manager to memory. Nothing in EBS snapshots. CloudTrail records every read. |
+| No key material at rest, with `aws:sm` and `aws:ssm` | Secrets Manager to memory. Nothing in EBS snapshots. CloudTrail records every read. This holds for the `aws:sm` and `aws:ssm` schemes. `gocloak keygen` writes the private key and PSK to disk at 0600, and the `file:` scheme reads key material from disk, so both leave key material at rest by design. |
 | Instant revocation | A peers file change removes the peer from the live device. The next packet from that key is dropped. No restart, no window. |
 
 ## What goCloak does not protect against

@@ -162,6 +162,32 @@ func (h *serverHarness) waitRun(d time.Duration) error {
 	}
 }
 
+// serverTestAwaitListening waits until Run has logged that it is listening,
+// which it does only after the UDP socket is bound and the initial peer list
+// is applied. It returns Run's error if Run gave up first, which is how a
+// stolen listen port surfaces.
+func serverTestAwaitListening(h *serverHarness) error {
+	h.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		select {
+		case err := <-h.runErr:
+			h.runDone = true
+			if err == nil {
+				err = errors.New("Run returned nil before listening")
+			}
+			return err
+		case <-time.After(time.Millisecond):
+		}
+		if strings.Contains(h.logs.String(), "gocloak: server listening") {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("Run did not log that it was listening within 30s")
+		}
+	}
+}
+
 // serverTestStart writes peers.yaml, starts a real Server on a real
 // WireGuard device over localhost UDP, and tears it all down at test end.
 func serverTestStart(t *testing.T, peers ...*serverTestPeer) *serverHarness {
@@ -173,42 +199,62 @@ func serverTestStart(t *testing.T, peers ...*serverTestPeer) *serverHarness {
 	priv, pub := deviceTestKeypair(t)
 	t.Setenv("GOCLOAK_TEST_SERVER_PRIV", deviceTestB64(priv))
 
-	port := deviceTestFreeUDPPort(t)
-	srv, err := NewServer(ServerConfig{
-		ListenPort: port,
-		PrivateKey: "env:GOCLOAK_TEST_SERVER_PRIV",
-		TunnelIP:   deviceTestServerIP,
-		PeersFile:  peersPath,
-	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
 	h := &serverHarness{
 		t:         t,
-		srv:       srv,
 		peersPath: peersPath,
-		udpPort:   port,
 		serverPub: pub,
-		logs:      &serverTestLog{},
 		reloads:   make(chan serverTestReload, 8),
 		runErr:    make(chan error, 1),
 	}
 
-	// Test seams, all unexported: no AWS, a capturable logger, and a
-	// signal that a reload finished being applied to the live device.
-	srv.resolver = &SecretResolver{}
-	srv.logger = slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv.onReloadApplied = func(r ReloadResult, err error) {
-		select {
-		case h.reloads <- serverTestReload{res: r, err: err}:
-		default:
-		}
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
-	go func() { h.runErr <- srv.Run(ctx) }()
+
+	// deviceTestFreeUDPPort binds a port, reads the number and closes, so
+	// the port is unreserved again until Run binds it, and the suite makes
+	// enough ephemeral sockets of its own to take it in that gap. A stolen
+	// port makes Run return a bind error immediately, so wait for the
+	// listening line and re-pick rather than fail the test on a collision.
+	for attempt := 0; ; attempt++ {
+		h.udpPort = deviceTestFreeUDPPort(t)
+		srv, err := NewServer(ServerConfig{
+			ListenPort: h.udpPort,
+			PrivateKey: "env:GOCLOAK_TEST_SERVER_PRIV",
+			TunnelIP:   deviceTestServerIP,
+			PeersFile:  peersPath,
+		})
+		if err != nil {
+			cancel()
+			t.Fatalf("NewServer: %v", err)
+		}
+
+		// Test seams, all unexported: no AWS, a capturable logger, and
+		// a signal that a reload finished being applied to the live
+		// device. The log sink is fresh per attempt so a test never
+		// reads lines from an attempt that lost its port.
+		h.logs = &serverTestLog{}
+		srv.resolver = &SecretResolver{}
+		srv.logger = slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		srv.onReloadApplied = func(r ReloadResult, err error) {
+			select {
+			case h.reloads <- serverTestReload{res: r, err: err}:
+			default:
+			}
+		}
+
+		h.srv = srv
+		h.runDone = false
+		go func() { h.runErr <- srv.Run(ctx) }()
+
+		err = serverTestAwaitListening(h)
+		if err == nil {
+			break
+		}
+		if attempt == 2 {
+			cancel()
+			t.Fatalf("server did not come up after 3 port picks: %v", err)
+		}
+	}
 
 	t.Cleanup(func() {
 		cancel()

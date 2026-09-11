@@ -297,7 +297,13 @@ func securityCaptureInitiation(t *testing.T, serverPub string, ip netip.Addr, pr
 	// Provoke the handshake: a TCP SYN inside the tunnel is what makes the
 	// device decide it needs a session. The dial can only fail, and it is
 	// bounded by its own context.
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	//
+	// The provoking dial must outlive the sink read, not the other way
+	// round: it is the goroutine holding the dial open that makes the
+	// device retransmit, and WireGuard's RekeyTimeout puts a retransmit at
+	// about 5.3s. Killing the provoker first would leave the reader
+	// waiting for a packet nothing is going to send.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
@@ -307,7 +313,7 @@ func securityCaptureInitiation(t *testing.T, serverPub string, ip netip.Addr, pr
 		}
 	}()
 
-	if err := sink.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := sink.SetReadDeadline(time.Now().Add(8 * time.Second)); err != nil {
 		t.Fatalf("capture deadline: %v", err)
 	}
 	buf := make([]byte, 2048)
@@ -315,7 +321,7 @@ func securityCaptureInitiation(t *testing.T, serverPub string, ip netip.Addr, pr
 	cancel()
 	<-done
 	if err != nil {
-		t.Fatalf("no handshake initiation was emitted within 5s: %v", err)
+		t.Fatalf("no handshake initiation was emitted within 8s: %v", err)
 	}
 
 	if n != wgInitiationSize {

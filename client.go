@@ -475,11 +475,16 @@ func (c *Client) dialControl(ctx, budget context.Context) (net.Conn, error) {
 // that varies with the failure is the beginning of exactly the
 // distinguishing signal section 8.1 exists to deny.
 //
+// Both branches round to 100ms for the same reason. At 1ms resolution a
+// scheduling delay over 500 microseconds between the deadline stamp and
+// start reports 2.999s where another dial reports 3s, and that one
+// character is a difference the message must not carry.
+//
 // budget always carries a deadline, since Dial builds it with
 // context.WithTimeout. The fallback is for a caller that is not Dial.
 func handshakeBound(budget context.Context, start time.Time) time.Duration {
 	if deadline, ok := budget.Deadline(); ok {
-		return deadline.Sub(start).Round(time.Millisecond)
+		return deadline.Sub(start).Round(100 * time.Millisecond)
 	}
 	return time.Since(start).Round(100 * time.Millisecond)
 }

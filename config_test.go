@@ -588,7 +588,7 @@ func TestConfigHotReloadConcurrentReads(t *testing.T) {
 
 	for i := 0; i < 50; i++ {
 		writeFile(t, path, onePeerYAML("app-01", testKey(1), "10.99.0.7", "primary-db", "192.0.2.10:3306"))
-		if r := w.Reload(); r.Err != nil {
+		if r := w.reload(); r.Err != nil {
 			t.Errorf("Reload: %v", r.Err)
 			break
 		}
@@ -610,7 +610,7 @@ func TestConfigReloadDiffByPublicKey(t *testing.T) {
 
 	// Same public key, different grant: a change, not an add plus remove.
 	writeFile(t, path, onePeerYAML("app-01", testKey(1), "10.99.0.7", "cache", "192.0.2.11:6379"))
-	r := w.Reload()
+	r := w.reload()
 	if r.Err != nil {
 		t.Fatalf("Reload: %v", r.Err)
 	}
@@ -622,7 +622,7 @@ func TestConfigReloadDiffByPublicKey(t *testing.T) {
 	}
 
 	// An identical file is not a change at all.
-	r = w.Reload()
+	r = w.reload()
 	if r.Err != nil {
 		t.Fatalf("Reload: %v", r.Err)
 	}
@@ -633,7 +633,7 @@ func TestConfigReloadDiffByPublicKey(t *testing.T) {
 	// A new key for the same name is a remove plus an add, which is what
 	// the WireGuard device needs to be told.
 	writeFile(t, path, onePeerYAML("app-01", testKey(9), "10.99.0.7", "cache", "192.0.2.11:6379"))
-	r = w.Reload()
+	r = w.reload()
 	if r.Err != nil {
 		t.Fatalf("Reload: %v", r.Err)
 	}

@@ -579,6 +579,14 @@ func (s *Server) refreshPeers(cfg *PeersConfig) {
 			// still open on this device at that address, and the
 			// stricter reading is the fail-closed one. The inherited
 			// count drains as those connections close.
+			//
+			// Because the limiter object survives, it is not in the
+			// gone set below, so the departed peer's in-flight
+			// connections are NOT reaped in this one case. They hold
+			// their backend file descriptors until they close on their
+			// own. The departed peer's keypair is destroyed by
+			// applyDiff, so it can neither send nor receive on them:
+			// the cost is leaked descriptors, not access.
 			l.setLimits(p.Limits)
 			limiters[ip] = l
 			continue

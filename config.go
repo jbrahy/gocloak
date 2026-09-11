@@ -671,8 +671,8 @@ type PeerWatcher struct {
 
 	cur atomic.Pointer[PeersConfig]
 
-	// mu serializes reload attempts (a filesystem event and an explicit
-	// Reload can race). Readers never take it: they go through cur.
+	// mu serializes reload attempts (a filesystem event and the periodic
+	// re-arm can race). Readers never take it: they go through cur.
 	mu   sync.Mutex
 	seen fileID
 
@@ -761,14 +761,22 @@ func (w *PeerWatcher) Config() *PeersConfig {
 	return w.cur.Load()
 }
 
-// Reload re-reads and re-validates the peers file, then swaps it in. The
+// reload re-reads and re-validates the peers file, then swaps it in. The
 // entire file is parsed, validated and turned into a new Policy before
 // anything is swapped, so a malformed or invalid file leaves the previous
 // config in force: a typo neither revokes everyone nor widens access.
 //
 // It is safe to call concurrently with readers and with the watcher's own
-// reloads. It is exported so a server can also reload on SIGHUP.
-func (w *PeerWatcher) Reload() ReloadResult {
+// reloads.
+//
+// It must only ever be called as report(reload()). The swap alone leaves
+// the policy new and the device old: it is report that reaches the
+// callback which removes a revoked peer's keypair from the live device.
+// The diff is computed against the config this call replaces, so a caller
+// that drops the result drops that removal permanently, and no later
+// reload will ever list the peer again. Unexported so that a caller
+// outside this package cannot make that mistake.
+func (w *PeerWatcher) reload() ReloadResult {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.reloadLocked()
@@ -859,7 +867,7 @@ func (w *PeerWatcher) Run(ctx context.Context) error {
 			resetTimer(debounce, reloadDebounce)
 
 		case <-debounce.C:
-			w.report(w.Reload())
+			w.report(w.reload())
 
 		case <-rearm.C:
 			// Belt and braces: re-add the watch and reload if the
