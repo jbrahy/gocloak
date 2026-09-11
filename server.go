@@ -94,13 +94,13 @@ type Server struct {
 
 	// resolver resolves secret references. It is created on demand in Run
 	// so a test can substitute one that needs no AWS.
-	resolver *SecretResolver
+	resolver *secretResolver
 
 	// onReloadApplied, if non-nil, is called after a reload has been
 	// applied to the live device, with the watcher's result and the error
 	// from applying it. It exists for tests; nothing in production sets
 	// it.
-	onReloadApplied func(ReloadResult, error)
+	onReloadApplied func(reloadResult, error)
 
 	started atomic.Bool
 
@@ -109,7 +109,7 @@ type Server struct {
 	baseCtx context.Context
 
 	dev     *tunnelDevice
-	watcher *PeerWatcher
+	watcher *peerWatcher
 
 	// mu guards the per-peer maps below, which are rebuilt on reload and
 	// read by every connection.
@@ -120,7 +120,7 @@ type Server struct {
 	// secretMu guards pskCache. It is separate from mu so a slow secret
 	// store lookup never blocks a connection's peer name lookup.
 	secretMu sync.Mutex
-	pskCache map[SecretRef]Secret
+	pskCache map[SecretRef]secret
 
 	wg sync.WaitGroup
 }
@@ -152,8 +152,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.MTU == 0 {
 		cfg.MTU = DefaultMTU
 	}
-	if cfg.MTU < MinMTU || cfg.MTU > MaxMTU {
-		return nil, fmt.Errorf("gocloak: server: mtu %d is not in %d-%d", cfg.MTU, MinMTU, MaxMTU)
+	if cfg.MTU < minMTU || cfg.MTU > maxMTU {
+		return nil, fmt.Errorf("gocloak: server: mtu %d is not in %d-%d", cfg.MTU, minMTU, maxMTU)
 	}
 	if cfg.PeersFile == "" {
 		return nil, errors.New("gocloak: server: peers file is required")
@@ -172,7 +172,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		logger:    slog.Default(),
 		peerNames: map[netip.Addr]string{},
 		limiters:  map[netip.Addr]*peerLimiter{},
-		pskCache:  map[SecretRef]Secret{},
+		pskCache:  map[SecretRef]secret{},
 	}, nil
 }
 
@@ -189,7 +189,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	s.baseCtx = ctx
 
 	if s.resolver == nil {
-		r, rerr := NewSecretResolver(ctx)
+		r, rerr := newSecretResolver(ctx)
 		if rerr != nil {
 			return fmt.Errorf("gocloak: server: secret resolver: %w", rerr)
 		}
@@ -203,7 +203,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 
 	// The watcher reloads and validates peers.yaml on every change and
 	// keeps the previous good config in force when a reload fails.
-	watcher, werr := NewPeerWatcher(s.cfg.PeersFile, s.handleReload)
+	watcher, werr := newPeerWatcher(s.cfg.PeersFile, s.handleReload)
 	if werr != nil {
 		return werr
 	}
@@ -235,7 +235,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	// startup: a server that came up missing a peer, or with a peer that
 	// has no PSK, is not the configuration the operator approved.
 	initial := watcher.Config()
-	for _, p := range initial.Peers {
+	for _, p := range initial.peers {
 		if aerr := s.applyPeer(ctx, p, false); aerr != nil {
 			return aerr
 		}
@@ -285,7 +285,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 		"tunnel_ip", s.cfg.TunnelIP.String(),
 		"mtu", s.cfg.MTU,
 		"peers_file", s.cfg.PeersFile,
-		"peers", len(initial.Peers))
+		"peers", len(initial.peers))
 
 	for {
 		conn, aerr := ln.Accept()
@@ -361,25 +361,25 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	if reason, allowed := limiter.acquire(time.Now()); !allowed {
-		_ = s.respond(conn, StatusRateLimited)
+		_ = s.respond(conn, statusRateLimited)
 		s.logger.Warn("gocloak: rate limited",
-			"peer", peer, "status", StatusRateLimited.String(),
+			"peer", peer, "status", statusRateLimited.String(),
 			"limit", reason, "duration_ms", millis(start))
 		return
 	}
 	defer limiter.release()
 
-	if err := conn.SetReadDeadline(time.Now().Add(HelloReadDeadline)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(helloReadDeadline)); err != nil {
 		s.logger.Error("gocloak: could not set the hello read deadline", "peer", peer, "error", err.Error())
 		return
 	}
 
-	service, err := ReadHelloRequest(conn)
+	service, err := readHelloRequest(conn)
 	if err != nil {
-		if errors.Is(err, ErrMalformedFrame) {
-			_ = s.respond(conn, StatusMalformed)
+		if errors.Is(err, errMalformedFrame) {
+			_ = s.respond(conn, statusMalformed)
 			s.logger.Warn("gocloak: malformed hello frame",
-				"peer", peer, "status", StatusMalformed.String(), "duration_ms", millis(start))
+				"peer", peer, "status", statusMalformed.String(), "duration_ms", millis(start))
 			return
 		}
 		// Not malformed: an I/O error, or the peer sent nothing and
@@ -393,13 +393,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	// The limiter already ran, above the hello read, so a peer cannot use
 	// denied lookups as a free hammer either.
-	backend, granted := s.watcher.Policy().Resolve(peerIP, service)
+	backend, granted := s.watcher.policy().Resolve(peerIP, service)
 	if !granted {
-		_ = s.respond(conn, StatusDenied)
+		_ = s.respond(conn, statusDenied)
 		// Spec section 8.2: a request for a service the peer was not
 		// granted is a security event, logged with peer and name.
 		s.logger.Warn("gocloak: service denied",
-			"peer", peer, "service", service, "status", StatusDenied.String(), "duration_ms", millis(start))
+			"peer", peer, "service", service, "status", statusDenied.String(), "duration_ms", millis(start))
 		return
 	}
 
@@ -407,9 +407,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	backendConn, derr := (&net.Dialer{}).DialContext(dialCtx, "tcp", backend.String())
 	cancel()
 	if derr != nil {
-		_ = s.respond(conn, StatusBackendUnavailable)
+		_ = s.respond(conn, statusBackendUnavailable)
 		s.logger.Warn("gocloak: backend unavailable",
-			"peer", peer, "service", service, "status", StatusBackendUnavailable.String(),
+			"peer", peer, "service", service, "status", statusBackendUnavailable.String(),
 			"backend", backend.String(), "duration_ms", millis(start), "error", derr.Error())
 		return
 	}
@@ -422,9 +422,43 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	// is removed too, not only when the tunnel drops.
 	live := &liveConn{peerConn: conn, backendConn: backendConn}
 	limiter.track(live)
+
+	// Re-check the peer's authorization now that the connection is
+	// registered. Everything above this line is a window: limiterFor ran
+	// before the hello read, which can sit on its deadline for five
+	// seconds, and the backend dial can take ten more. A reload landing
+	// anywhere in that window drains a live set this connection had not
+	// joined yet, so without this check the connection would register
+	// against a limiter that is no longer in force and never be reaped.
+	//
+	// The check is a pointer comparison against the limiter now in force
+	// for this address. refreshPeers builds a fresh limiter whenever the
+	// peer occupying an address is removed or replaced by a different
+	// public key, so a mismatch means exactly one thing: the authorization
+	// this connection was admitted under is gone. Fail closed. A
+	// connection whose authorization may have been revoked mid setup must
+	// not become a live proxy, so it is closed here rather than answered.
+	//
+	// The ordering is load bearing. track must come first, or a reload
+	// that lands between the check and the registration would leave the
+	// same orphan this closes. untrack is called explicitly on this path
+	// and the defer is registered only after the check passes, so the
+	// registration is removed exactly once either way. Both connections
+	// and the concurrency slot are released by the defers above.
+	if current, ok := s.limiterFor(peerIP); !ok || current != limiter {
+		limiter.untrack(live)
+		// Nothing is written back, for the same reason the no-entry
+		// path above writes nothing: a status frame is a metered
+		// reply, and this peer's meter is exactly what is no longer in
+		// force. Spec section 7.1 makes silence to an unauthorized
+		// party a designed property.
+		s.logger.Warn("gocloak: peer was revoked or replaced while the connection was being set up, closed without a reply",
+			"peer", peer, "service", service, "duration_ms", millis(start))
+		return
+	}
 	defer limiter.untrack(live)
 
-	if err := s.respond(conn, StatusOK); err != nil {
+	if err := s.respond(conn, statusOK); err != nil {
 		s.logger.Warn("gocloak: could not write the hello response",
 			"peer", peer, "service", service, "duration_ms", millis(start), "error", err.Error())
 		return
@@ -443,7 +477,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	s.logger.Info("gocloak: connection closed",
 		"peer", peer,
 		"service", service,
-		"status", StatusOK.String(),
+		"status", statusOK.String(),
 		"bytes_sent", sent,
 		"bytes_received", received,
 		"duration_ms", millis(start))
@@ -451,11 +485,11 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 // respond writes one hello response frame under a bounded write deadline,
 // so a peer that stops reading cannot pin a goroutine forever.
-func (s *Server) respond(conn net.Conn, status Status) error {
-	if err := conn.SetWriteDeadline(time.Now().Add(HelloReadDeadline)); err != nil {
+func (s *Server) respond(conn net.Conn, status status) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(helloReadDeadline)); err != nil {
 		return err
 	}
-	return WriteHelloResponse(conn, status)
+	return writeHelloResponse(conn, status)
 }
 
 // pipeConns copies bytes in both directions until either direction ends,
@@ -551,6 +585,11 @@ func (s *Server) limiterFor(ip netip.Addr) (*peerLimiter, bool) {
 // that is gone is dropped, and every connection still proxying for that peer
 // is closed.
 //
+// "The same peer" means the same public key, not the same tunnel address. A
+// reload that removes peer A and adds peer B at the same 10.99.0.N builds a
+// fresh limiter for B, so A's limiter lands in the gone set and A's
+// in-flight connections are reaped like any other departure.
+//
 // The close matters: removing the peer from the device stops it sending, but
 // an already-established connection is a raw pipe with its deadlines cleared,
 // so without this its backend connection and both file descriptors would stay
@@ -565,33 +604,45 @@ func (s *Server) refreshPeers(cfg *PeersConfig) {
 
 	s.mu.Lock()
 
-	names := make(map[netip.Addr]string, len(cfg.Peers))
-	limiters := make(map[netip.Addr]*peerLimiter, len(cfg.Peers))
-	for _, p := range cfg.Peers {
+	names := make(map[netip.Addr]string, len(cfg.peers))
+	limiters := make(map[netip.Addr]*peerLimiter, len(cfg.peers))
+	for _, p := range cfg.peers {
 		ip := p.TunnelIP.Unmap()
 		names[ip] = p.Name
-		if l, ok := s.limiters[ip]; ok {
-			// Limiters are keyed by tunnel address, not by public key,
-			// so if one reload removes a peer and adds a different one
-			// at the same address, the new peer inherits the old one's
-			// live concurrency count and its partly spent bucket. That
-			// is deliberate: the count reflects connections that are
-			// still open on this device at that address, and the
-			// stricter reading is the fail-closed one. The inherited
-			// count drains as those connections close.
-			//
-			// Because the limiter object survives, it is not in the
-			// gone set below, so the departed peer's in-flight
-			// connections are NOT reaped in this one case. They hold
-			// their backend file descriptors until they close on their
-			// own. The departed peer's keypair is destroyed by
-			// applyDiff, so it can neither send nor receive on them:
-			// the cost is leaked descriptors, not access.
+		if l, ok := s.limiters[ip]; ok && l.publicKey == p.PublicKey {
+			// Same peer, same address: the limiter survives the reload
+			// so its in-flight connections keep their accounting and a
+			// changed limit applies to them immediately.
 			l.setLimits(p.Limits)
 			limiters[ip] = l
 			continue
 		}
-		limiters[ip] = newPeerLimiter(p.Limits)
+		// Either nothing held this address, or a DIFFERENT peer did.
+		// A limiter's identity is the peer, not the address, and the
+		// public key is what makes a peer that peer: the reload diff is
+		// keyed by public key, and a key change is what actually swaps
+		// one party for another behind an unchanged 10.99.0.N.
+		//
+		// So a replacement gets a brand new limiter, which leaves the
+		// old one out of the kept set below and therefore in the gone
+		// set, and its in-flight connections are reaped like any other
+		// departure. Keying by address instead would keep the old
+		// object alive, leave it out of the gone set, and let the
+		// departed peer's proxied connections and their backend file
+		// descriptors outlive the revocation.
+		//
+		// The new peer starts at a zero concurrency count, which is
+		// correct rather than lax: the connections that count was
+		// counting are closed by the reap a few lines below, so
+		// inheriting it would charge the arriving peer for connections
+		// that no longer exist. The fail-closed direction is the one
+		// that reaps. Getting this wrong the other way leaves live
+		// proxied connections running for an identity the operator has
+		// just removed, which is the outcome the reap exists to
+		// prevent; getting it wrong this way at worst hands the
+		// arriving peer the concurrency budget its own config already
+		// grants it.
+		limiters[ip] = newPeerLimiter(p.PublicKey, p.Limits)
 	}
 
 	kept := make(map[*peerLimiter]struct{}, len(limiters))
@@ -619,7 +670,7 @@ func (s *Server) refreshPeers(cfg *PeersConfig) {
 
 // handleReload applies one reload to the live device. It runs in the
 // watcher's goroutine, which Run waits for before closing the device.
-func (s *Server) handleReload(r ReloadResult) {
+func (s *Server) handleReload(r reloadResult) {
 	if r.Err != nil {
 		// Spec section 8.2: the previous good config stays in force
 		// and the failure is logged loudly. A typo must neither
@@ -674,7 +725,7 @@ func (s *Server) handleReload(r ReloadResult) {
 	s.notifyReload(r, applyErr)
 }
 
-func (s *Server) notifyReload(r ReloadResult, err error) {
+func (s *Server) notifyReload(r reloadResult, err error) {
 	if s.onReloadApplied != nil {
 		s.onReloadApplied(r, err)
 	}
@@ -686,7 +737,7 @@ func (s *Server) notifyReload(r ReloadResult, err error) {
 // possible instant, and a failure later in the diff must not have delayed
 // it. Every step's error is collected and returned rather than swallowed: a
 // revocation that silently failed is the worst outcome this design has.
-func (s *Server) applyDiff(d PeerDiff) error {
+func (s *Server) applyDiff(d peerDiff) error {
 	if s.dev == nil {
 		return errors.New("gocloak: server: reload arrived before the device existed")
 	}
@@ -728,7 +779,7 @@ func (s *Server) applyDiff(d PeerDiff) error {
 // applyPeer resolves a peer's PSK and applies the peer to the device.
 // updateOnly=true never creates a peer, which is what a Changed entry
 // means: it modifies an existing grant and must not bring one into being.
-func (s *Server) applyPeer(ctx context.Context, p PeerConfig, updateOnly bool) error {
+func (s *Server) applyPeer(ctx context.Context, p peerConfig, updateOnly bool) error {
 	psk, err := s.resolveSecret(ctx, p.PSK)
 	if err != nil {
 		return fmt.Errorf("gocloak: server: peer %s: psk: %w", p.Name, err)
@@ -763,7 +814,7 @@ func (s *Server) applyPeer(ctx context.Context, p PeerConfig, updateOnly bool) e
 // The returned error never carries the reference itself: secret.go's errors
 // name the reference they failed on, and constraint 4 keeps a reference out
 // of a log line, so it is scrubbed here rather than at every call site.
-func (s *Server) resolveSecret(ctx context.Context, ref SecretRef) (Secret, error) {
+func (s *Server) resolveSecret(ctx context.Context, ref SecretRef) (secret, error) {
 	s.secretMu.Lock()
 	defer s.secretMu.Unlock()
 
@@ -772,7 +823,7 @@ func (s *Server) resolveSecret(ctx context.Context, ref SecretRef) (Secret, erro
 	}
 	sec, err := s.resolver.Resolve(ctx, ref)
 	if err != nil {
-		return Secret{}, scrubRef(err, ref)
+		return secret{}, scrubRef(err, ref)
 	}
 	s.pskCache[ref] = sec
 	return sec, nil
@@ -782,7 +833,7 @@ func (s *Server) resolveSecret(ctx context.Context, ref SecretRef) (Secret, erro
 // the peer list, so a revoked peer's PSK does not stay resident.
 func (s *Server) pruneSecretCache() {
 	inUse := map[SecretRef]struct{}{s.cfg.PrivateKey: {}}
-	for _, p := range s.watcher.Config().Peers {
+	for _, p := range s.watcher.Config().peers {
 		inUse[p.PSK] = struct{}{}
 	}
 
@@ -849,6 +900,13 @@ const redactedRefPlaceholder = "[REDACTED REF]"
 // refreshPeers on exactly the reload boundary a revocation crosses, and
 // already the thing that counts a connection as live.
 type peerLimiter struct {
+	// publicKey is the peer this limiter belongs to. It is the limiter's
+	// identity across a reload: an address is a slot a peer occupies, and
+	// two different keys at one address are two different peers. It is
+	// set once at construction and never written again, so it is read
+	// without the lock.
+	publicKey string
+
 	mu            sync.Mutex
 	maxConcurrent int
 	rate          float64
@@ -867,8 +925,8 @@ type liveConn struct {
 	backendConn net.Conn
 }
 
-func newPeerLimiter(l PeerLimits) *peerLimiter {
-	p := &peerLimiter{last: time.Now(), live: map[*liveConn]struct{}{}}
+func newPeerLimiter(publicKey string, l peerLimits) *peerLimiter {
+	p := &peerLimiter{publicKey: publicKey, last: time.Now(), live: map[*liveConn]struct{}{}}
 	p.setLimits(l)
 	p.mu.Lock()
 	p.tokens = p.burst
@@ -879,7 +937,7 @@ func newPeerLimiter(l PeerLimits) *peerLimiter {
 // setLimits applies a peer's limits, which a hot reload can change. The
 // bucket is clamped to the new burst so lowering a limit takes effect
 // immediately rather than after the old allowance drains.
-func (p *peerLimiter) setLimits(l PeerLimits) {
+func (p *peerLimiter) setLimits(l peerLimits) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.maxConcurrent = l.MaxConcurrent

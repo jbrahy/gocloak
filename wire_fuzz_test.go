@@ -6,7 +6,7 @@ import (
 )
 
 // FuzzHelloFrame fuzzes both frame parsers against arbitrary bytes. Neither
-// parser should ever panic, and ReadHelloRequest must never return a name
+// parser should ever panic, and readHelloRequest must never return a name
 // that fails its own charset check, regardless of what bytes it was fed:
 // the codec is the boundary that receives input from an authenticated but
 // possibly compromised peer, so it must survive anything.
@@ -34,19 +34,19 @@ func FuzzHelloFrame(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		name, err := ReadHelloRequest(bytes.NewReader(data))
+		name, err := readHelloRequest(bytes.NewReader(data))
 		if err == nil {
 			if !ValidServiceName(name) {
-				t.Fatalf("ReadHelloRequest accepted a name that fails its own charset check: %q", name)
+				t.Fatalf("readHelloRequest accepted a name that fails its own charset check: %q", name)
 			}
 			if len(name) == 0 || len(name) > maxNameLen {
-				t.Fatalf("ReadHelloRequest accepted an out-of-range name length: %d", len(name))
+				t.Fatalf("readHelloRequest accepted an out-of-range name length: %d", len(name))
 			}
 		}
 
-		status, err := ReadHelloResponse(bytes.NewReader(data))
+		status, err := readHelloResponse(bytes.NewReader(data))
 		if err == nil && !validStatus(status) {
-			t.Fatalf("ReadHelloResponse accepted an unknown status byte: %v", status)
+			t.Fatalf("readHelloResponse accepted an unknown status byte: %v", status)
 		}
 	})
 }

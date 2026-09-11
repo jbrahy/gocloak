@@ -37,11 +37,11 @@ const serverTestDialBudget = 25 * time.Second
 // its tunnel address, and what peers.yaml should say about it.
 type serverTestPeer struct {
 	Name   string
-	Priv   Secret
+	Priv   secret
 	Pub    string
-	PSK    Secret
+	PSK    secret
 	IP     netip.Addr
-	Limits PeerLimits
+	Limits peerLimits
 	Allow  map[string]string
 
 	// PSKMissing makes the peer's psk reference name an environment
@@ -131,7 +131,7 @@ func (l *serverTestLog) String() string {
 
 // serverTestReload is one delivery of the server's post-reload hook.
 type serverTestReload struct {
-	res ReloadResult
+	res reloadResult
 	err error
 }
 
@@ -233,9 +233,9 @@ func serverTestStart(t *testing.T, peers ...*serverTestPeer) *serverHarness {
 		// device. The log sink is fresh per attempt so a test never
 		// reads lines from an attempt that lost its port.
 		h.logs = &serverTestLog{}
-		srv.resolver = &SecretResolver{}
+		srv.resolver = &secretResolver{}
 		srv.logger = slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		srv.onReloadApplied = func(r ReloadResult, err error) {
+		srv.onReloadApplied = func(r reloadResult, err error) {
 			select {
 			case h.reloads <- serverTestReload{res: r, err: err}:
 			default:
@@ -329,16 +329,16 @@ func serverTestConnect(t *testing.T, d *tunnelDevice) net.Conn {
 
 // serverTestHello connects and performs the hello exchange, returning the
 // live connection and the status the server answered with.
-func serverTestHello(t *testing.T, d *tunnelDevice, service string) (net.Conn, Status) {
+func serverTestHello(t *testing.T, d *tunnelDevice, service string) (net.Conn, status) {
 	t.Helper()
 	c := serverTestConnect(t, d)
-	if err := WriteHelloRequest(c, service); err != nil {
+	if err := writeHelloRequest(c, service); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
 	if err := c.SetReadDeadline(time.Now().Add(serverTestDialBudget)); err != nil {
 		t.Fatalf("set read deadline: %v", err)
 	}
-	status, err := ReadHelloResponse(c)
+	status, err := readHelloResponse(c)
 	if err != nil {
 		t.Fatalf("read hello response: %v", err)
 	}
@@ -354,10 +354,10 @@ func serverTestHello(t *testing.T, d *tunnelDevice, service string) (net.Conn, S
 // flight on the server, holding a concurrency slot until the hello deadline
 // closes it. Retrying on a refusal costs nothing (a refused connection takes
 // no slot) and keeps a limit test off the clock.
-func serverTestHelloUntil(t *testing.T, d *tunnelDevice, service string, want Status, budget time.Duration) net.Conn {
+func serverTestHelloUntil(t *testing.T, d *tunnelDevice, service string, want status, budget time.Duration) net.Conn {
 	t.Helper()
 	deadline := time.Now().Add(budget)
-	var last Status
+	var last status
 	for {
 		conn, status := serverTestHello(t, d, service)
 		if status == want {
@@ -444,7 +444,7 @@ func TestServerEndToEndBytesFlowBothWays(t *testing.T) {
 	client := h.client(peer)
 
 	conn, status := serverTestHello(t, client, "primary-db")
-	if status != StatusOK {
+	if status != statusOK {
 		t.Fatalf("status = %v, want ok", status)
 	}
 
@@ -478,7 +478,7 @@ func TestServerDeniedServiceIsRefusedAndNeverDialsABackend(t *testing.T) {
 	client := h.client(peer)
 
 	_, status := serverTestHello(t, client, "cache")
-	if status != StatusDenied {
+	if status != statusDenied {
 		t.Fatalf("status = %v, want denied", status)
 	}
 	if got := backend.conns.Load(); got != 0 {
@@ -520,7 +520,7 @@ func TestServerPeerCannotReachAnotherPeersService(t *testing.T) {
 	}
 
 	connA, statusA := serverTestHello(t, clientA, "db")
-	if statusA != StatusOK {
+	if statusA != statusOK {
 		t.Fatalf("peer A status = %v, want ok", statusA)
 	}
 	if got := read4(connA); got != "AAAA" {
@@ -528,7 +528,7 @@ func TestServerPeerCannotReachAnotherPeersService(t *testing.T) {
 	}
 
 	connB, statusB := serverTestHello(t, clientB, "db")
-	if statusB != StatusOK {
+	if statusB != statusOK {
 		t.Fatalf("peer B status = %v, want ok", statusB)
 	}
 	if got := read4(connB); got != "BBBB" {
@@ -538,7 +538,7 @@ func TestServerPeerCannotReachAnotherPeersService(t *testing.T) {
 	// A service only peer A is granted is denied to peer B, and peer B
 	// never touches peer A's backend.
 	before := backendA.conns.Load()
-	if _, status := serverTestHello(t, clientB, "only-a"); status != StatusDenied {
+	if _, status := serverTestHello(t, clientB, "only-a"); status != statusDenied {
 		t.Fatalf("peer B asking for peer A's service: status = %v, want denied", status)
 	}
 	if after := backendA.conns.Load(); after != before {
@@ -559,7 +559,7 @@ func TestServerBackendUnavailableIsDistinctFromDenied(t *testing.T) {
 	client := h.client(peer)
 
 	_, status := serverTestHello(t, client, "primary-db")
-	if status != StatusBackendUnavailable {
+	if status != statusBackendUnavailable {
 		t.Fatalf("status = %v, want backend unavailable", status)
 	}
 }
@@ -570,7 +570,7 @@ func TestServerMalformedHelloFrameIsAnswered(t *testing.T) {
 	peer := serverTestNewPeer(t, "app-01", "10.99.0.7")
 	// The limiter runs before the hello read, so the peer needs budget to
 	// reach the parser at all.
-	peer.Limits = PeerLimits{MaxConcurrent: 8, DialsPerSecond: 8}
+	peer.Limits = peerLimits{MaxConcurrent: 8, DialsPerSecond: 8}
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
@@ -586,7 +586,7 @@ func TestServerMalformedHelloFrameIsAnswered(t *testing.T) {
 	if _, err := io.ReadFull(conn, resp[:]); err != nil {
 		t.Fatalf("read response: %v", err)
 	}
-	if resp[0] != 0x01 || Status(resp[1]) != StatusMalformed {
+	if resp[0] != 0x01 || status(resp[1]) != statusMalformed {
 		t.Fatalf("response = %#v, want version 0x01 and status malformed", resp)
 	}
 }
@@ -601,9 +601,9 @@ func TestServerSilentPeerIsClosedByTheDeadlineWithNoResponse(t *testing.T) {
 
 	conn := serverTestConnect(t, client)
 
-	// Generously past HelloReadDeadline, so the close is the deadline's
+	// Generously past helloReadDeadline, so the close is the deadline's
 	// doing and the read below is not the thing that gave up first.
-	if err := conn.SetReadDeadline(time.Now().Add(HelloReadDeadline + 20*time.Second)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(helloReadDeadline + 20*time.Second)); err != nil {
 		t.Fatalf("set read deadline: %v", err)
 	}
 	buf := make([]byte, 8)
@@ -615,7 +615,7 @@ func TestServerSilentPeerIsClosedByTheDeadlineWithNoResponse(t *testing.T) {
 		t.Fatal("read returned no error, want the connection to have been closed")
 	}
 	if errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("the connection was still open after %v; the hello read deadline did not close it", HelloReadDeadline)
+		t.Fatalf("the connection was still open after %v; the hello read deadline did not close it", helloReadDeadline)
 	}
 }
 
@@ -630,15 +630,15 @@ func TestServerMaxConcurrentIsEnforced(t *testing.T) {
 
 	peer := serverTestNewPeer(t, "app-01", "10.99.0.7")
 	peer.Allow["primary-db"] = backend.String()
-	peer.Limits = PeerLimits{MaxConcurrent: 1, DialsPerSecond: 100}
+	peer.Limits = peerLimits{MaxConcurrent: 1, DialsPerSecond: 100}
 
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
-	first := serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second)
+	first := serverTestHelloUntil(t, client, "primary-db", statusOK, 15*time.Second)
 	defer first.Close()
 
-	if _, status := serverTestHello(t, client, "primary-db"); status != StatusRateLimited {
+	if _, status := serverTestHello(t, client, "primary-db"); status != statusRateLimited {
 		t.Fatalf("second status = %v, want rate limited", status)
 	}
 }
@@ -658,14 +658,14 @@ func TestServerMaxConcurrentBoundsConnectionsThatSendNothing(t *testing.T) {
 
 	peer := serverTestNewPeer(t, "app-01", "10.99.0.7")
 	peer.Allow["primary-db"] = backend.String()
-	peer.Limits = PeerLimits{MaxConcurrent: maxConcurrent, DialsPerSecond: 100}
+	peer.Limits = peerLimits{MaxConcurrent: maxConcurrent, DialsPerSecond: 100}
 
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
 	// Warm the tunnel up with a completed exchange, so the dials below
 	// are immediate and the handshake is not part of the timing.
-	serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second).Close()
+	serverTestHelloUntil(t, client, "primary-db", statusOK, 15*time.Second).Close()
 
 	// Open the cap's worth of connections that send nothing at all. Each
 	// one sits on the hello deadline, which is five seconds, so they are
@@ -687,7 +687,7 @@ func TestServerMaxConcurrentBoundsConnectionsThatSendNothing(t *testing.T) {
 	for {
 		conn, status := serverTestHello(t, client, "primary-db")
 		conn.Close()
-		if status == StatusRateLimited {
+		if status == statusRateLimited {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -702,7 +702,7 @@ func TestServerMaxConcurrentBoundsConnectionsThatSendNothing(t *testing.T) {
 	for _, c := range silent {
 		c.Close()
 	}
-	serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second).Close()
+	serverTestHelloUntil(t, client, "primary-db", statusOK, 15*time.Second).Close()
 }
 
 // TestServerDialsPerSecondIsEnforced sets a bucket of one dial per second
@@ -712,7 +712,7 @@ func TestServerDialsPerSecondIsEnforced(t *testing.T) {
 
 	peer := serverTestNewPeer(t, "app-01", "10.99.0.7")
 	peer.Allow["primary-db"] = backend.String()
-	peer.Limits = PeerLimits{MaxConcurrent: 64, DialsPerSecond: 1}
+	peer.Limits = peerLimits{MaxConcurrent: 64, DialsPerSecond: 1}
 
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
@@ -722,9 +722,9 @@ func TestServerDialsPerSecondIsEnforced(t *testing.T) {
 	// take milliseconds, so the bucket cannot refill in the middle of
 	// them, but asserting on the burst rather than on one exact attempt
 	// keeps the test off the clock.
-	serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second).Close()
+	serverTestHelloUntil(t, client, "primary-db", statusOK, 15*time.Second).Close()
 
-	var statuses []Status
+	var statuses []status
 	for i := 0; i < 3; i++ {
 		conn, status := serverTestHello(t, client, "primary-db")
 		conn.Close()
@@ -733,7 +733,7 @@ func TestServerDialsPerSecondIsEnforced(t *testing.T) {
 
 	limited := 0
 	for _, st := range statuses {
-		if st == StatusRateLimited {
+		if st == statusRateLimited {
 			limited++
 		}
 	}
@@ -754,15 +754,15 @@ func TestServerRateLimitIsCheckedBeforePolicy(t *testing.T) {
 
 	peer := serverTestNewPeer(t, "app-01", "10.99.0.7")
 	peer.Allow["primary-db"] = backend.String()
-	peer.Limits = PeerLimits{MaxConcurrent: 1, DialsPerSecond: 100}
+	peer.Limits = peerLimits{MaxConcurrent: 1, DialsPerSecond: 100}
 
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
-	first := serverTestHelloUntil(t, client, "primary-db", StatusOK, 15*time.Second)
+	first := serverTestHelloUntil(t, client, "primary-db", statusOK, 15*time.Second)
 	defer first.Close()
 
-	if _, status := serverTestHello(t, client, "not-granted"); status != StatusRateLimited {
+	if _, status := serverTestHello(t, client, "not-granted"); status != statusRateLimited {
 		t.Fatalf("status = %v, want rate limited: the limiter must run before policy resolution", status)
 	}
 }
@@ -770,7 +770,7 @@ func TestServerRateLimitIsCheckedBeforePolicy(t *testing.T) {
 // TestServerLimiterAccounting unit-tests the limiter itself, including the
 // refill and the release of a concurrency slot.
 func TestServerLimiterAccounting(t *testing.T) {
-	l := newPeerLimiter(PeerLimits{MaxConcurrent: 2, DialsPerSecond: 2})
+	l := newPeerLimiter("test-public-key", peerLimits{MaxConcurrent: 2, DialsPerSecond: 2})
 	now := time.Now()
 
 	if reason, ok := l.acquire(now); !ok {
@@ -830,12 +830,12 @@ func TestServerHotReloadRevokesAPeer(t *testing.T) {
 
 	// Both peers work before the revocation, so the failure afterwards is
 	// attributable to the revocation and not to a broken harness.
-	if conn, status := serverTestHello(t, clientA, "db"); status != StatusOK {
+	if conn, status := serverTestHello(t, clientA, "db"); status != statusOK {
 		t.Fatalf("peer A before revocation: status = %v, want ok", status)
 	} else {
 		conn.Close()
 	}
-	if conn, status := serverTestHello(t, clientB, "db"); status != StatusOK {
+	if conn, status := serverTestHello(t, clientB, "db"); status != statusOK {
 		t.Fatalf("peer B before revocation: status = %v, want ok", status)
 	} else {
 		conn.Close()
@@ -865,7 +865,7 @@ func TestServerHotReloadRevokesAPeer(t *testing.T) {
 	}
 
 	// The peer that stayed is unaffected.
-	if conn, status := serverTestHello(t, clientB, "db"); status != StatusOK {
+	if conn, status := serverTestHello(t, clientB, "db"); status != statusOK {
 		t.Fatalf("peer B after revocation: status = %v, want ok", status)
 	} else {
 		conn.Close()
@@ -932,13 +932,13 @@ func TestServerRevocationClosesInFlightProxiedConnections(t *testing.T) {
 	}
 
 	doomedConn, status := serverTestHello(t, doomedClient, "db")
-	if status != StatusOK {
+	if status != statusOK {
 		t.Fatalf("doomed peer: status = %v, want ok", status)
 	}
 	exchange(doomedConn, "doomed peer before revocation")
 
 	survivorConn, status := serverTestHello(t, survivorClient, "db")
-	if status != StatusOK {
+	if status != statusOK {
 		t.Fatalf("surviving peer: status = %v, want ok", status)
 	}
 	exchange(survivorConn, "surviving peer before revocation")
@@ -1001,6 +1001,290 @@ func serverTestAwaitLogLine(t *testing.T, h *serverHarness, first, second string
 	}
 }
 
+// TestServerReplacingAPeerAtTheSameTunnelIPReapsTheDepartedPeer covers the
+// case a reap keyed by tunnel address misses: one reload removes peer A and
+// adds a DIFFERENT peer B at the same 10.99.0.N. The address is still
+// occupied, so an address-keyed limiter set would keep A's limiter, leave it
+// out of the gone set, and let A's in-flight proxied connection and its
+// backend file descriptor outlive the revocation. Limiters carry the peer's
+// public key, so the replacement is a departure and A is reaped.
+func TestServerReplacingAPeerAtTheSameTunnelIPReapsTheDepartedPeer(t *testing.T) {
+	doomedReleased := make(chan struct{})
+	var releaseOnce sync.Once
+	doomedBackend := serverTestNewBackend(t, func(c net.Conn) {
+		defer c.Close()
+		io.Copy(c, c)
+		releaseOnce.Do(func() { close(doomedReleased) })
+	})
+	survivorBackend := serverTestNewBackend(t, serverTestEcho)
+
+	doomed := serverTestNewPeer(t, "app-doomed", "10.99.0.7")
+	doomed.Allow["db"] = doomedBackend.String()
+	survivor := serverTestNewPeer(t, "app-survivor", "10.99.0.8")
+	survivor.Allow["db"] = survivorBackend.String()
+
+	h := serverTestStart(t, doomed, survivor)
+	doomedClient := h.client(doomed)
+	survivorClient := h.client(survivor)
+
+	exchange := func(conn net.Conn, who string) {
+		t.Helper()
+		if err := conn.SetDeadline(time.Now().Add(serverTestDialBudget)); err != nil {
+			t.Fatalf("%s: set deadline: %v", who, err)
+		}
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatalf("%s: write to backend: %v", who, err)
+		}
+		buf := make([]byte, 4)
+		if _, err := readFullConn(conn, buf); err != nil {
+			t.Fatalf("%s: read from backend: %v", who, err)
+		}
+		if string(buf) != "ping" {
+			t.Fatalf("%s: backend echoed %q, want %q", who, buf, "ping")
+		}
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			t.Fatalf("%s: clear deadline: %v", who, err)
+		}
+	}
+
+	doomedConn, status := serverTestHello(t, doomedClient, "db")
+	if status != statusOK {
+		t.Fatalf("doomed peer: status = %v, want ok", status)
+	}
+	exchange(doomedConn, "doomed peer before replacement")
+
+	survivorConn, status := serverTestHello(t, survivorClient, "db")
+	if status != statusOK {
+		t.Fatalf("surviving peer: status = %v, want ok", status)
+	}
+	exchange(survivorConn, "surviving peer before replacement")
+
+	before, ok := h.srv.limiterFor(doomed.IP)
+	if !ok {
+		t.Fatalf("no limiter for %s before the reload", doomed.IP)
+	}
+
+	// The replacement is a different peer, with its own keypair and its
+	// own PSK, that happens to be handed the address the departing peer
+	// had. Its allow map is identical, so nothing but the identity
+	// changes and the reap cannot be attributed to a policy change.
+	replacement := serverTestNewPeer(t, "app-replacement", "10.99.0.7")
+	replacement.Allow["db"] = doomedBackend.String()
+	if replacement.Pub == doomed.Pub {
+		t.Fatal("the replacement peer got the departing peer's public key, which is not a replacement")
+	}
+	serverTestWritePeers(t, h.peersPath, []*serverTestPeer{replacement, survivor})
+
+	got := h.awaitReload()
+	if got.res.Err != nil {
+		t.Fatalf("reload reported a parse error: %v", got.res.Err)
+	}
+	if got.err != nil {
+		t.Fatalf("applying the reload to the live device failed: %v", got.err)
+	}
+	if names := peerNames(got.res.Diff.Removed); len(names) != 1 || names[0] != "app-doomed" {
+		t.Fatalf("diff removed %v, want exactly [app-doomed]", names)
+	}
+	if names := peerNames(got.res.Diff.Added); len(names) != 1 || names[0] != "app-replacement" {
+		t.Fatalf("diff added %v, want exactly [app-replacement]", names)
+	}
+
+	// The address is still occupied, and by a different limiter: the
+	// arriving peer did not inherit the departing peer's object, its
+	// live connection set or its concurrency count.
+	after, ok := h.srv.limiterFor(doomed.IP)
+	if !ok {
+		t.Fatalf("no limiter for %s after the reload: the replacement peer is unusable", doomed.IP)
+	}
+	if after == before {
+		t.Fatal("the replacement peer inherited the departed peer's limiter: a different key at the same address is a different peer")
+	}
+	if after.publicKey != replacement.Pub {
+		t.Fatal("the limiter now in force does not carry the replacement peer's public key")
+	}
+
+	// 1. The departed peer's backend connection is released, so the file
+	//    descriptor it held is freed rather than leaked until the backend
+	//    happens to close it.
+	select {
+	case <-doomedReleased:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the departed peer's backend connection was never released: replacing a peer at the same tunnel ip let its in-flight connection escape the reap")
+	}
+
+	// 2. The handler unwound, which happens only once both sides of the
+	//    proxy are closed, so the peer-side connection is closed too and
+	//    the concurrency slot is back.
+	if !serverTestAwaitLogLine(t, h, `"gocloak: connection closed"`, `"peer":"app-doomed"`, 20*time.Second) {
+		t.Fatalf("the departed peer's connection handler never unwound; logs:\n%s", h.logs.String())
+	}
+
+	// The peer that was not touched by this reload keeps its session.
+	exchange(survivorConn, "surviving peer after replacement")
+}
+
+// TestServerRevocationDuringConnectionSetupIsNotProxied closes the window
+// between limiterFor and track. A connection is admitted under one peer's
+// limiter, the peer is then revoked and replaced while the handler is still
+// in setup, and the connection must not become a working proxy.
+//
+// The connection is injected rather than tunnelled, and this is the reason:
+// the window it exercises opens when the handler captures the limiter and
+// closes when the handler registers the connection, and the only points a
+// test can hold the handler inside it are the hello read and the backend
+// dial. Neither is reachable through a real tunnel once the peer is revoked,
+// because revocation destroys the peer's keypair and the client can no
+// longer put a byte on the wire. A net.Pipe gives the test the hello read as
+// a hard synchronisation point: the handler blocks there until the test
+// writes, so the reload lands inside the window every run rather than in a
+// race the test would have to lose to fail.
+//
+// What this proves: the re-check branch closes the connection, releases the
+// backend, returns the concurrency slot and removes the registration,
+// exactly once, and that it answers nothing. What it does NOT prove: that a
+// real tunnelled connection can be caught mid dial. The peer side here is a
+// pipe with a fake remote address, not netstack TCP, and only the peer side
+// is faked: the server, the reload, the policy, the limiters and the backend
+// are all real.
+func TestServerRevocationDuringConnectionSetupIsNotProxied(t *testing.T) {
+	backendReleased := make(chan struct{})
+	var releaseOnce sync.Once
+	backend := serverTestNewBackend(t, func(c net.Conn) {
+		defer c.Close()
+		io.Copy(c, c)
+		releaseOnce.Do(func() { close(backendReleased) })
+	})
+
+	doomed := serverTestNewPeer(t, "app-doomed", "10.99.0.7")
+	doomed.Allow["db"] = backend.String()
+
+	h := serverTestStart(t, doomed)
+
+	before, ok := h.srv.limiterFor(doomed.IP)
+	if !ok {
+		t.Fatalf("no limiter for %s at startup", doomed.IP)
+	}
+
+	peerSide, serverSide := net.Pipe()
+	t.Cleanup(func() { peerSide.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	handlerDone := make(chan struct{})
+	h.srv.wg.Add(1)
+	go func() {
+		defer close(handlerDone)
+		h.srv.handleConn(ctx, serverTestConnWithAddr{
+			Conn: serverSide,
+			addr: serverTestFakeAddr(netip.AddrPortFrom(doomed.IP, 41234).String()),
+		})
+	}()
+
+	// The handler has entered the window once it holds a concurrency
+	// slot: acquire runs immediately after limiterFor, so a held slot
+	// means the limiter pointer has been captured, and the next thing the
+	// handler does is block on the hello read that nothing has written
+	// yet.
+	serverTestAwaitActive(t, before, 1, 20*time.Second)
+
+	// Revoke inside the window. The departing peer is replaced at the same
+	// address by a peer with an identical allow map, so the policy still
+	// grants "db" to 10.99.0.7 when the handler gets there: the re-check
+	// is the only thing standing between this connection and a live
+	// proxy.
+	replacement := serverTestNewPeer(t, "app-replacement", "10.99.0.7")
+	replacement.Allow["db"] = backend.String()
+	serverTestWritePeers(t, h.peersPath, []*serverTestPeer{replacement})
+
+	got := h.awaitReload()
+	if got.res.Err != nil {
+		t.Fatalf("reload reported a parse error: %v", got.res.Err)
+	}
+	if got.err != nil {
+		t.Fatalf("applying the reload to the live device failed: %v", got.err)
+	}
+	after, ok := h.srv.limiterFor(doomed.IP)
+	if !ok || after == before {
+		t.Fatal("the reload did not replace the limiter at the doomed peer's address, so this test would not exercise the re-check")
+	}
+
+	// Now let the handler out of the hello read. From here it resolves the
+	// policy, dials the backend and registers the connection, all against
+	// a limiter that is no longer in force.
+	if err := writeHelloRequest(peerSide, "db"); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	// 1. No response frame. The connection is closed in silence, like
+	//    every other unauthorized path, rather than answered.
+	if err := peerSide.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	status, err := readHelloResponse(peerSide)
+	if err == nil {
+		t.Fatalf("the server answered %v: a connection whose peer was revoked mid setup became a proxy", status)
+	}
+
+	// 2. The handler returned rather than proxying.
+	select {
+	case <-handlerDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the handler never returned: it is proxying for a peer that was revoked during setup")
+	}
+
+	// 3. The backend connection the handler dialed is closed, so the
+	//    descriptor is released rather than pinned by an orphan.
+	select {
+	case <-backendReleased:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the backend connection opened during setup was never released")
+	}
+
+	// 4. The registration and the concurrency slot are both given back,
+	//    exactly once, on the limiter the connection was admitted under.
+	serverTestAwaitActive(t, before, 0, 20*time.Second)
+	before.mu.Lock()
+	liveOnOld := len(before.live)
+	before.mu.Unlock()
+	if liveOnOld != 0 {
+		t.Fatalf("the departed limiter still tracks %d connections, want 0", liveOnOld)
+	}
+
+	// 5. The arriving peer's limiter never saw this connection at all.
+	after.mu.Lock()
+	liveOnNew, activeOnNew := len(after.live), after.active
+	after.mu.Unlock()
+	if liveOnNew != 0 || activeOnNew != 0 {
+		t.Fatalf("the replacement peer's limiter carries %d live and %d active, want 0 and 0", liveOnNew, activeOnNew)
+	}
+
+	if !serverTestAwaitLogLine(t, h, `"gocloak: peer was revoked or replaced while the connection was being set up`, `"peer":"app-doomed"`, 20*time.Second) {
+		t.Fatalf("the re-check did not log the refusal; logs:\n%s", h.logs.String())
+	}
+}
+
+// serverTestAwaitActive polls a limiter's concurrency count until it reaches
+// want. The count moves in another goroutine, so a test that needs to know
+// where a handler has got to has to wait for it rather than read it once.
+func serverTestAwaitActive(t *testing.T, l *peerLimiter, want int, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for {
+		l.mu.Lock()
+		got := l.active
+		l.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("limiter active count = %d after %v, want %d", got, budget, want)
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestServerHotReloadAddsAPeer covers the other direction: a peer added to
 // the file becomes usable without a restart.
 func TestServerHotReloadAddsAPeer(t *testing.T) {
@@ -1024,7 +1308,7 @@ func TestServerHotReloadAddsAPeer(t *testing.T) {
 		t.Fatalf("diff added %v, want exactly app-b", peerNames(got.res.Diff.Added))
 	}
 
-	if conn, status := serverTestHello(t, clientB, "db"); status != StatusOK {
+	if conn, status := serverTestHello(t, clientB, "db"); status != statusOK {
 		t.Fatalf("added peer: status = %v, want ok", status)
 	} else {
 		conn.Close()
@@ -1042,7 +1326,7 @@ func TestServerHotReloadKeepsPreviousPolicyOnABadFile(t *testing.T) {
 	h := serverTestStart(t, peer)
 	client := h.client(peer)
 
-	if conn, status := serverTestHello(t, client, "primary-db"); status != StatusOK {
+	if conn, status := serverTestHello(t, client, "primary-db"); status != statusOK {
 		t.Fatalf("before the bad reload: status = %v, want ok", status)
 	} else {
 		conn.Close()
@@ -1057,7 +1341,7 @@ func TestServerHotReloadKeepsPreviousPolicyOnABadFile(t *testing.T) {
 		t.Fatal("a peers file with an unknown key reloaded successfully, want an error")
 	}
 
-	if conn, status := serverTestHello(t, client, "primary-db"); status != StatusOK {
+	if conn, status := serverTestHello(t, client, "primary-db"); status != statusOK {
 		t.Fatalf("after the bad reload: status = %v, want ok: the previous policy must stay in force", status)
 	} else {
 		conn.Close()
@@ -1089,7 +1373,7 @@ func TestServerStartupFailsWhenThePrivateKeyCannotBeResolved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	srv.resolver = &SecretResolver{}
+	srv.resolver = &secretResolver{}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1134,7 +1418,7 @@ func TestServerStartupFailsWhenAPeerPSKCannotBeResolved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	srv.resolver = &SecretResolver{}
+	srv.resolver = &secretResolver{}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1330,7 +1614,7 @@ func TestServerScrubRefRedactsPayloadAndKeepsUnwrap(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "psk-that-does-not-exist")
 	ref := SecretRef("file:" + path)
 
-	resolver := &SecretResolver{}
+	resolver := &secretResolver{}
 	_, err := resolver.Resolve(context.Background(), ref)
 	if err == nil {
 		t.Fatal("resolving a missing file succeeded, want an error")
@@ -1382,9 +1666,9 @@ func TestServerLogsNeverContainKeyMaterial(t *testing.T) {
 	// real bytes, a denial, a malformed frame, a reload, and a reload
 	// whose peer PSK cannot be resolved, which is the one path that puts
 	// a scrubbed secret reference into a log line.
-	conn, status := serverTestHello(t, client, "primary-db")
-	if status != StatusOK {
-		t.Fatalf("status = %v, want ok", status)
+	conn, granted := serverTestHello(t, client, "primary-db")
+	if granted != statusOK {
+		t.Fatalf("status = %v, want ok", granted)
 	}
 	if err := conn.SetDeadline(time.Now().Add(serverTestDialBudget)); err != nil {
 		t.Fatalf("set deadline: %v", err)
@@ -1398,7 +1682,7 @@ func TestServerLogsNeverContainKeyMaterial(t *testing.T) {
 	}
 	conn.Close()
 
-	if _, status := serverTestHello(t, client, "cache"); status != StatusDenied {
+	if _, status := serverTestHello(t, client, "cache"); status != statusDenied {
 		t.Fatalf("denied status = %v, want denied", status)
 	}
 
@@ -1414,8 +1698,8 @@ func TestServerLogsNeverContainKeyMaterial(t *testing.T) {
 	if _, err := io.ReadFull(malformed, resp[:]); err != nil {
 		t.Fatalf("read malformed response: %v", err)
 	}
-	if Status(resp[1]) != StatusMalformed {
-		t.Fatalf("malformed status = %v, want malformed", Status(resp[1]))
+	if status(resp[1]) != statusMalformed {
+		t.Fatalf("malformed status = %v, want malformed", status(resp[1]))
 	}
 	malformed.Close()
 
@@ -1467,7 +1751,7 @@ func TestServerLogsNeverContainKeyMaterial(t *testing.T) {
 	// The fields that must be there, including the scrubbed placeholder,
 	// which proves the failing apply really did reach a log line.
 	for _, want := range []string{"app-01", "app-02", "primary-db", "bytes_sent", "bytes_received", "duration_ms",
-		StatusMalformed.String(), redactedRefPlaceholder} {
+		statusMalformed.String(), redactedRefPlaceholder} {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("logs do not contain %q; logs:\n%s", want, logs)
 		}
@@ -1483,7 +1767,7 @@ func TestServerADeadPeerWatchIsFatal(t *testing.T) {
 	h := serverTestStart(t, peer)
 
 	// One exchange first, so the server is provably up and serving.
-	if _, status := serverTestHello(t, h.client(peer), "nothing-granted"); status != StatusDenied {
+	if _, status := serverTestHello(t, h.client(peer), "nothing-granted"); status != statusDenied {
 		t.Fatalf("status = %v, want denied", status)
 	}
 
@@ -1509,7 +1793,7 @@ func TestServerRunIsSingleUse(t *testing.T) {
 
 	// Complete one exchange first, so the harness's Run is provably the
 	// call that took the single-use flag.
-	if _, status := serverTestHello(t, h.client(peer), "nothing-granted"); status != StatusDenied {
+	if _, status := serverTestHello(t, h.client(peer), "nothing-granted"); status != statusDenied {
 		t.Fatalf("status = %v, want denied", status)
 	}
 

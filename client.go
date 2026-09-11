@@ -187,8 +187,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.MTU != 0 && (cfg.MTU < MinMTU || cfg.MTU > MaxMTU) {
-		return nil, fmt.Errorf("gocloak: client: mtu %d is not in %d-%d", cfg.MTU, MinMTU, MaxMTU)
+	if cfg.MTU != 0 && (cfg.MTU < minMTU || cfg.MTU > maxMTU) {
+		return nil, fmt.Errorf("gocloak: client: mtu %d is not in %d-%d", cfg.MTU, minMTU, maxMTU)
 	}
 	if cfg.DialTimeout < 0 {
 		return nil, fmt.Errorf("gocloak: client: dial timeout %s is negative", cfg.DialTimeout)
@@ -351,7 +351,7 @@ func (c *Client) hello(ctx context.Context, conn net.Conn, service string) error
 	if err := conn.SetWriteDeadline(c.helloDeadline(ctx)); err != nil {
 		return fmt.Errorf("gocloak: client: %w", err)
 	}
-	if err := WriteHelloRequest(conn, service); err != nil {
+	if err := writeHelloRequest(conn, service); err != nil {
 		return c.helloError(ctx, err)
 	}
 	// The response read gets its own deadline, so a server that accepted
@@ -360,7 +360,7 @@ func (c *Client) hello(ctx context.Context, conn net.Conn, service string) error
 	if err := conn.SetReadDeadline(c.helloDeadline(ctx)); err != nil {
 		return fmt.Errorf("gocloak: client: %w", err)
 	}
-	status, err := ReadHelloResponse(conn)
+	status, err := readHelloResponse(conn)
 	if err != nil {
 		return c.helloError(ctx, err)
 	}
@@ -402,9 +402,9 @@ func (c *Client) finishHello(ctx context.Context, conn net.Conn, stop func() boo
 // spec's value, or the remaining budget when that is sooner. Without the
 // second half, DialTimeout would bound only the tunnel handshake and a
 // server that accepted the connection and then stalled could hold a caller
-// for HelloReadDeadline beyond the budget it asked for, twice over.
+// for helloReadDeadline beyond the budget it asked for, twice over.
 func (c *Client) helloDeadline(ctx context.Context) time.Time {
-	deadline := time.Now().Add(HelloReadDeadline)
+	deadline := time.Now().Add(helloReadDeadline)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		return d
 	}
@@ -514,27 +514,27 @@ func (c *Client) helloError(ctx context.Context, err error) error {
 	return fmt.Errorf("gocloak: client: hello exchange with %s: %w", c.endpointText, err)
 }
 
-// statusError maps a hello response status to its sentinel. StatusOK is the
+// statusError maps a hello response status to its sentinel. statusOK is the
 // only status that is not an error; an unrecognized one never reaches here,
-// because ReadHelloResponse rejects it as a malformed frame.
+// because readHelloResponse rejects it as a malformed frame.
 //
 // The service name is safe to echo: it passed ValidServiceName, whose
 // charset exists so a name can never inject control characters into a log
 // line.
-func statusError(status Status, service string) error {
+func statusError(status status, service string) error {
 	switch status {
-	case StatusOK:
+	case statusOK:
 		return nil
-	case StatusDenied:
+	case statusDenied:
 		return fmt.Errorf("%w: %s", ErrDenied, service)
-	case StatusBackendUnavailable:
+	case statusBackendUnavailable:
 		return fmt.Errorf("%w: %s", ErrBackendUnavailable, service)
-	case StatusRateLimited:
+	case statusRateLimited:
 		return fmt.Errorf("%w: %s", ErrRateLimited, service)
-	case StatusMalformed:
+	case statusMalformed:
 		return fmt.Errorf("%w: %s", ErrMalformedRequest, service)
 	default:
-		// Unreachable via ReadHelloResponse. Fail closed anyway: an
+		// Unreachable via readHelloResponse. Fail closed anyway: an
 		// unknown status is never a success.
 		return fmt.Errorf("gocloak: client: %s: unexpected status %s", service, status)
 	}
@@ -621,7 +621,7 @@ func clientTunnelIP(addr netip.Addr) (netip.Addr, error) {
 // clients are built only when a reference actually needs one, so a
 // deployment whose secrets are all file: or env: does not fail to start
 // because there is no AWS configuration in the environment.
-func clientSecretResolver(ctx context.Context, refs ...SecretRef) (*SecretResolver, error) {
+func clientSecretResolver(ctx context.Context, refs ...SecretRef) (*secretResolver, error) {
 	for _, ref := range refs {
 		scheme, _, err := parseSecretRef(ref)
 		if err != nil {
@@ -630,8 +630,8 @@ func clientSecretResolver(ctx context.Context, refs ...SecretRef) (*SecretResolv
 			continue
 		}
 		if strings.HasPrefix(scheme, "aws:") {
-			return NewSecretResolver(ctx)
+			return newSecretResolver(ctx)
 		}
 	}
-	return &SecretResolver{}, nil
+	return &secretResolver{}, nil
 }

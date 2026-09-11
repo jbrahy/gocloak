@@ -8,12 +8,12 @@ import (
 	"time"
 )
 
-// HelloReadDeadline is the read deadline the server applies while reading
+// helloReadDeadline is the read deadline the server applies while reading
 // the hello request from a newly accepted connection, per spec section 4.
 // This package never touches net.Conn deadlines itself: the caller sets and
 // clears them. Exported so server.go uses this exact spec value instead of
 // a fresh magic number.
-const HelloReadDeadline = 5 * time.Second
+const helloReadDeadline = 5 * time.Second
 
 // frameVersion is the only wire protocol version. There is no negotiation:
 // any other byte in the version position makes the frame malformed.
@@ -37,48 +37,48 @@ func ValidServiceName(name string) bool {
 	return nameRE.MatchString(name)
 }
 
-// ErrMalformedFrame is the sentinel wrapped into errors returned by
-// ReadHelloRequest and ReadHelloResponse when the bytes received do not
+// errMalformedFrame is the sentinel wrapped into errors returned by
+// readHelloRequest and readHelloResponse when the bytes received do not
 // form a valid frame: wrong version, an out-of-range declared length, an
 // invalid service name, or an unrecognized status byte. Callers can test
-// for it with errors.Is to decide whether to answer with StatusMalformed
+// for it with errors.Is to decide whether to answer with statusMalformed
 // before closing, as opposed to a plain I/O or timeout error, which
 // carries no such signal that a response is owed.
-var ErrMalformedFrame = errors.New("gocloak: malformed hello frame")
+var errMalformedFrame = errors.New("gocloak: malformed hello frame")
 
-// Status is a hello response status code.
-type Status byte
+// status is a hello response status code.
+type status byte
 
 const (
-	// StatusOK indicates the request was accepted. The connection becomes
+	// statusOK indicates the request was accepted. The connection becomes
 	// a raw bidirectional pipe with no further framing.
-	StatusOK Status = 0x00
-	// StatusDenied indicates the named service is unknown for this peer.
-	StatusDenied Status = 0x01
-	// StatusBackendUnavailable indicates the named service is known but
+	statusOK status = 0x00
+	// statusDenied indicates the named service is unknown for this peer.
+	statusDenied status = 0x01
+	// statusBackendUnavailable indicates the named service is known but
 	// its backend could not be reached.
-	StatusBackendUnavailable Status = 0x02
-	// StatusRateLimited indicates the request was refused by a rate
+	statusBackendUnavailable status = 0x02
+	// statusRateLimited indicates the request was refused by a rate
 	// limiter.
-	StatusRateLimited Status = 0x03
-	// StatusMalformed indicates the server could not parse the request.
-	StatusMalformed Status = 0x04
+	statusRateLimited status = 0x03
+	// statusMalformed indicates the server could not parse the request.
+	statusMalformed status = 0x04
 )
 
 // String implements fmt.Stringer for logging. An unrecognized status value
-// (which should never occur for a Status this package produced itself)
+// (which should never occur for a status this package produced itself)
 // renders as its hex byte rather than panicking or guessing.
-func (s Status) String() string {
+func (s status) String() string {
 	switch s {
-	case StatusOK:
+	case statusOK:
 		return "ok"
-	case StatusDenied:
+	case statusDenied:
 		return "denied"
-	case StatusBackendUnavailable:
+	case statusBackendUnavailable:
 		return "backend unavailable"
-	case StatusRateLimited:
+	case statusRateLimited:
 		return "rate limited"
-	case StatusMalformed:
+	case statusMalformed:
 		return "malformed request"
 	default:
 		return fmt.Sprintf("unknown status 0x%02x", byte(s))
@@ -87,20 +87,20 @@ func (s Status) String() string {
 
 // validStatus reports whether s is one of the five defined status codes.
 // An unknown status byte is never treated as success.
-func validStatus(s Status) bool {
+func validStatus(s status) bool {
 	switch s {
-	case StatusOK, StatusDenied, StatusBackendUnavailable, StatusRateLimited, StatusMalformed:
+	case statusOK, statusDenied, statusBackendUnavailable, statusRateLimited, statusMalformed:
 		return true
 	default:
 		return false
 	}
 }
 
-// WriteHelloRequest writes a hello request frame naming the service the
+// writeHelloRequest writes a hello request frame naming the service the
 // client wants to reach: version byte, length byte, name bytes. name is
 // validated with ValidServiceName before anything is written, so an
 // invalid name is never put on the wire.
-func WriteHelloRequest(w io.Writer, name string) error {
+func writeHelloRequest(w io.Writer, name string) error {
 	if !ValidServiceName(name) {
 		return errors.New("gocloak: invalid service name")
 	}
@@ -114,44 +114,44 @@ func WriteHelloRequest(w io.Writer, name string) error {
 	return nil
 }
 
-// ReadHelloRequest reads and validates a hello request frame from r. Every
+// readHelloRequest reads and validates a hello request frame from r. Every
 // byte is treated as hostile: the version and declared length are
 // validated before any allocation is sized from them, and a short read of
 // the name (fewer than the declared N bytes available) is always an error,
 // never a partial success. On success it returns the validated service
 // name; on failure it never echoes the attacker-supplied name bytes back
 // in the returned error.
-func ReadHelloRequest(r io.Reader) (string, error) {
+func readHelloRequest(r io.Reader) (string, error) {
 	var head [2]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
 		return "", fmt.Errorf("gocloak: read hello request header: %w", err)
 	}
 	if head[0] != frameVersion {
-		return "", fmt.Errorf("%w: unsupported version 0x%02x", ErrMalformedFrame, head[0])
+		return "", fmt.Errorf("%w: unsupported version 0x%02x", errMalformedFrame, head[0])
 	}
 
 	n := int(head[1])
 	if n == 0 || n > maxNameLen {
-		return "", fmt.Errorf("%w: invalid name length %d", ErrMalformedFrame, n)
+		return "", fmt.Errorf("%w: invalid name length %d", errMalformedFrame, n)
 	}
 
 	// n is validated to be within 1..maxNameLen above; only now do we
 	// allocate a buffer sized from it.
 	nameBytes := make([]byte, n)
 	if _, err := io.ReadFull(r, nameBytes); err != nil {
-		return "", fmt.Errorf("%w: short read of name", ErrMalformedFrame)
+		return "", fmt.Errorf("%w: short read of name", errMalformedFrame)
 	}
 
 	name := string(nameBytes)
 	if !ValidServiceName(name) {
-		return "", fmt.Errorf("%w: invalid service name", ErrMalformedFrame)
+		return "", fmt.Errorf("%w: invalid service name", errMalformedFrame)
 	}
 	return name, nil
 }
 
-// WriteHelloResponse writes a hello response frame with the given status:
+// writeHelloResponse writes a hello response frame with the given status:
 // version byte, status byte.
-func WriteHelloResponse(w io.Writer, status Status) error {
+func writeHelloResponse(w io.Writer, status status) error {
 	if !validStatus(status) {
 		return fmt.Errorf("gocloak: invalid status 0x%02x", byte(status))
 	}
@@ -162,20 +162,20 @@ func WriteHelloResponse(w io.Writer, status Status) error {
 	return nil
 }
 
-// ReadHelloResponse reads and validates a hello response frame from r. An
+// readHelloResponse reads and validates a hello response frame from r. An
 // unrecognized status byte is always an error, never treated as success:
 // the client fails closed on anything it does not recognize.
-func ReadHelloResponse(r io.Reader) (Status, error) {
+func readHelloResponse(r io.Reader) (status, error) {
 	var frame [2]byte
 	if _, err := io.ReadFull(r, frame[:]); err != nil {
 		return 0, fmt.Errorf("gocloak: read hello response: %w", err)
 	}
 	if frame[0] != frameVersion {
-		return 0, fmt.Errorf("%w: unsupported version 0x%02x", ErrMalformedFrame, frame[0])
+		return 0, fmt.Errorf("%w: unsupported version 0x%02x", errMalformedFrame, frame[0])
 	}
-	status := Status(frame[1])
+	status := status(frame[1])
 	if !validStatus(status) {
-		return 0, fmt.Errorf("%w: unknown status 0x%02x", ErrMalformedFrame, frame[1])
+		return 0, fmt.Errorf("%w: unknown status 0x%02x", errMalformedFrame, frame[1])
 	}
 	return status, nil
 }

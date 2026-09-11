@@ -36,7 +36,7 @@ func TestPolicyResolve(t *testing.T) {
 	backendBCache := mustAddrPort("192.0.2.12:6379")
 	backendBShared := mustAddrPort("192.0.2.13:6379")
 
-	pol, err := NewPolicy([]PeerPolicy{
+	pol, err := newPolicy([]peerPolicy{
 		{
 			TunnelIP: peerA,
 			Allow: map[string]netip.AddrPort{
@@ -57,7 +57,7 @@ func TestPolicyResolve(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewPolicy: unexpected error: %v", err)
+		t.Fatalf("newPolicy: unexpected error: %v", err)
 	}
 
 	tests := []struct {
@@ -140,7 +140,7 @@ func TestPolicyResolve_CaseSensitive(t *testing.T) {
 	peerA := mustAddr("10.99.0.2")
 	backend := mustAddrPort("192.0.2.10:3306")
 
-	pol, err := NewPolicy([]PeerPolicy{
+	pol, err := newPolicy([]peerPolicy{
 		{
 			TunnelIP: peerA,
 			Allow: map[string]netip.AddrPort{
@@ -149,7 +149,7 @@ func TestPolicyResolve_CaseSensitive(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewPolicy: unexpected error: %v", err)
+		t.Fatalf("newPolicy: unexpected error: %v", err)
 	}
 
 	if _, ok := pol.Resolve(peerA, "Primary-DB"); ok {
@@ -160,7 +160,7 @@ func TestPolicyResolve_CaseSensitive(t *testing.T) {
 	}
 }
 
-// TestPolicy_NewRejects covers construction-time validation: a Policy value
+// TestPolicy_NewRejects covers construction-time validation: a policy value
 // that exists must be safe to consult, so bad input must fail loudly here
 // rather than at lookup time.
 func TestPolicy_NewRejects(t *testing.T) {
@@ -170,73 +170,73 @@ func TestPolicy_NewRejects(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		peers []PeerPolicy
+		peers []peerPolicy
 	}{
 		{
 			name: "duplicate tunnel ip across two peers",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": validBackend}},
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"b": validBackend}},
 			},
 		},
 		{
 			name: "invalid service name: uppercase",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"Primary-DB": validBackend}},
 			},
 		},
 		{
 			name: "invalid service name: empty",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"": validBackend}},
 			},
 		},
 		{
 			name: "zero tunnel ip",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: netip.Addr{}, Allow: map[string]netip.AddrPort{"a": validBackend}},
 			},
 		},
 		{
 			name: "unspecified tunnel ip",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: netip.IPv4Unspecified(), Allow: map[string]netip.AddrPort{"a": validBackend}},
 			},
 		},
 		{
 			name: "malformed backend address: zero value",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": netip.AddrPort{}}},
 			},
 		},
 		{
 			name: "malformed backend address: zero port",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": netip.AddrPortFrom(mustAddr("192.0.2.10"), 0)}},
 			},
 		},
 		{
 			name: "unspecified backend address: 0.0.0.0",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": mustAddrPort("0.0.0.0:3306")}},
 			},
 		},
 		{
 			name: "unspecified backend address: [::]",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": mustAddrPort("[::]:3306")}},
 			},
 		},
 		{
 			name: "duplicate tunnel ip: IPv4 and its IPv4-in-IPv6 spelling",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: mustAddr("10.99.0.7"), Allow: map[string]netip.AddrPort{"a": validBackend}},
 				{TunnelIP: mustAddr("::ffff:10.99.0.7"), Allow: map[string]netip.AddrPort{"b": validBackend}},
 			},
 		},
 		{
 			name: "one bad peer among good peers still fails the whole construction",
-			peers: []PeerPolicy{
+			peers: []peerPolicy{
 				{TunnelIP: validIP, Allow: map[string]netip.AddrPort{"a": validBackend}},
 				{TunnelIP: otherIP, Allow: map[string]netip.AddrPort{"Bad-Name": validBackend}},
 			},
@@ -245,21 +245,21 @@ func TestPolicy_NewRejects(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			pol, err := NewPolicy(tc.peers)
+			pol, err := newPolicy(tc.peers)
 			if err == nil {
-				t.Fatalf("NewPolicy(%s): expected error, got nil (policy=%+v)", tc.name, pol)
+				t.Fatalf("newPolicy(%s): expected error, got nil (policy=%+v)", tc.name, pol)
 			}
 			if pol != nil {
-				t.Fatalf("NewPolicy(%s): expected nil policy on error, got %+v", tc.name, pol)
+				t.Fatalf("newPolicy(%s): expected nil policy on error, got %+v", tc.name, pol)
 			}
 		})
 	}
 }
 
 // TestPolicy_NewAccepts is the construction-side happy path: valid input
-// builds a usable Policy.
+// builds a usable policy.
 func TestPolicy_NewAccepts(t *testing.T) {
-	pol, err := NewPolicy([]PeerPolicy{
+	pol, err := newPolicy([]peerPolicy{
 		{
 			TunnelIP: mustAddr("10.99.0.2"),
 			Allow: map[string]netip.AddrPort{
@@ -268,19 +268,19 @@ func TestPolicy_NewAccepts(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewPolicy: unexpected error: %v", err)
+		t.Fatalf("newPolicy: unexpected error: %v", err)
 	}
 	if pol == nil {
-		t.Fatalf("NewPolicy: expected non-nil policy")
+		t.Fatalf("newPolicy: expected non-nil policy")
 	}
 }
 
 // TestPolicy_NewEmpty asserts that an empty peer list is valid and denies
 // everything, since default deny is the whole point.
 func TestPolicy_NewEmpty(t *testing.T) {
-	pol, err := NewPolicy(nil)
+	pol, err := newPolicy(nil)
 	if err != nil {
-		t.Fatalf("NewPolicy(nil): unexpected error: %v", err)
+		t.Fatalf("newPolicy(nil): unexpected error: %v", err)
 	}
 	if _, ok := pol.Resolve(mustAddr("10.99.0.2"), "primary-db"); ok {
 		t.Fatalf("Resolve against empty policy must deny, got allow")
@@ -296,22 +296,22 @@ func TestPolicy_NewEmpty(t *testing.T) {
 func TestPolicyResolve_UnmapsIPv4InIPv6(t *testing.T) {
 	backend := mustAddrPort("192.0.2.10:3306")
 
-	polV4, err := NewPolicy([]PeerPolicy{
+	polV4, err := newPolicy([]peerPolicy{
 		{TunnelIP: mustAddr("10.99.0.7"), Allow: map[string]netip.AddrPort{"primary-db": backend}},
 	})
 	if err != nil {
-		t.Fatalf("NewPolicy: unexpected error: %v", err)
+		t.Fatalf("newPolicy: unexpected error: %v", err)
 	}
 	got, ok := polV4.Resolve(mustAddr("::ffff:10.99.0.7"), "primary-db")
 	if !ok || got != backend {
 		t.Fatalf("Resolve(mapped form of a policy built with plain IPv4) = %v, %v; want %v, true", got, ok, backend)
 	}
 
-	polMapped, err := NewPolicy([]PeerPolicy{
+	polMapped, err := newPolicy([]peerPolicy{
 		{TunnelIP: mustAddr("::ffff:10.99.0.7"), Allow: map[string]netip.AddrPort{"primary-db": backend}},
 	})
 	if err != nil {
-		t.Fatalf("NewPolicy: unexpected error: %v", err)
+		t.Fatalf("newPolicy: unexpected error: %v", err)
 	}
 	got, ok = polMapped.Resolve(mustAddr("10.99.0.7"), "primary-db")
 	if !ok || got != backend {
@@ -320,7 +320,7 @@ func TestPolicyResolve_UnmapsIPv4InIPv6(t *testing.T) {
 }
 
 // TestPolicyResolve_ConcurrentReads exercises Resolve from many goroutines
-// against a single Policy value, to be run with -race. The Policy must be
+// against a single policy value, to be run with -race. The policy must be
 // safe to share across goroutines by construction, since task 7's server
 // reads it concurrently while task 5's hot reload swaps it out.
 func TestPolicyResolve_ConcurrentReads(t *testing.T) {
@@ -329,12 +329,12 @@ func TestPolicyResolve_ConcurrentReads(t *testing.T) {
 	backendA := mustAddrPort("192.0.2.10:3306")
 	backendB := mustAddrPort("192.0.2.11:6379")
 
-	pol, err := NewPolicy([]PeerPolicy{
+	pol, err := newPolicy([]peerPolicy{
 		{TunnelIP: peerA, Allow: map[string]netip.AddrPort{"primary-db": backendA}},
 		{TunnelIP: peerB, Allow: map[string]netip.AddrPort{"cache": backendB}},
 	})
 	if err != nil {
-		t.Fatalf("NewPolicy: unexpected error: %v", err)
+		t.Fatalf("newPolicy: unexpected error: %v", err)
 	}
 
 	var wg sync.WaitGroup

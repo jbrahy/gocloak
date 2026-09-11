@@ -180,10 +180,10 @@ func TestConfigPeersDecode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPeersConfig: %v", err)
 	}
-	if len(cfg.Peers) != 1 {
-		t.Fatalf("len(Peers) = %d, want 1", len(cfg.Peers))
+	if len(cfg.peers) != 1 {
+		t.Fatalf("len(peers) = %d, want 1", len(cfg.peers))
 	}
-	p := cfg.Peers[0]
+	p := cfg.peers[0]
 	if p.Name != "app-01" {
 		t.Errorf("Name = %q", p.Name)
 	}
@@ -206,13 +206,13 @@ func TestConfigPeersDecode(t *testing.T) {
 		t.Errorf("Allow[cache] = %v", got)
 	}
 
-	// The Policy built from the file is the thing the server consults.
-	backend, ok := cfg.Policy.Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db")
+	// The policy built from the file is the thing the server consults.
+	backend, ok := cfg.policy.Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db")
 	if !ok || backend != netip.MustParseAddrPort("192.0.2.10:3306") {
-		t.Errorf("Policy.Resolve = %v, %v", backend, ok)
+		t.Errorf("policy.Resolve = %v, %v", backend, ok)
 	}
-	if _, ok := cfg.Policy.Resolve(netip.MustParseAddr("10.99.0.8"), "primary-db"); ok {
-		t.Error("Policy resolved an unknown peer")
+	if _, ok := cfg.policy.Resolve(netip.MustParseAddr("10.99.0.8"), "primary-db"); ok {
+		t.Error("policy resolved an unknown peer")
 	}
 }
 
@@ -228,10 +228,10 @@ func TestConfigPeersLimitsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPeersConfig: %v", err)
 	}
-	if got := cfg.Peers[0].Limits.MaxConcurrent; got != DefaultMaxConcurrent {
+	if got := cfg.peers[0].Limits.MaxConcurrent; got != DefaultMaxConcurrent {
 		t.Errorf("MaxConcurrent = %d, want %d", got, DefaultMaxConcurrent)
 	}
-	if got := cfg.Peers[0].Limits.DialsPerSecond; got != DefaultDialsPerSecond {
+	if got := cfg.peers[0].Limits.DialsPerSecond; got != DefaultDialsPerSecond {
 		t.Errorf("DialsPerSecond = %d, want %d", got, DefaultDialsPerSecond)
 	}
 }
@@ -244,13 +244,13 @@ func TestConfigPeersEmptyListAccepted(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LoadPeersConfig(%q): %v", yaml, err)
 		}
-		if len(cfg.Peers) != 0 {
-			t.Errorf("len(Peers) = %d, want 0", len(cfg.Peers))
+		if len(cfg.peers) != 0 {
+			t.Errorf("len(peers) = %d, want 0", len(cfg.peers))
 		}
-		if cfg.Policy == nil {
-			t.Fatal("Policy is nil for an empty peer list")
+		if cfg.policy == nil {
+			t.Fatal("policy is nil for an empty peer list")
 		}
-		if _, ok := cfg.Policy.Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db"); ok {
+		if _, ok := cfg.policy.Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db"); ok {
 			t.Error("empty policy granted access")
 		}
 	}
@@ -340,19 +340,19 @@ func TestConfigPeersRejects(t *testing.T) {
 	}
 }
 
-// newTestWatcher starts a PeerWatcher over path, runs it, and returns the
+// newTestWatcher starts a peerWatcher over path, runs it, and returns the
 // watcher plus a channel of reload results.
-func newTestWatcher(t *testing.T, path string) (*PeerWatcher, <-chan ReloadResult) {
+func newTestWatcher(t *testing.T, path string) (*peerWatcher, <-chan reloadResult) {
 	t.Helper()
-	results := make(chan ReloadResult, 64)
-	w, err := NewPeerWatcher(path, func(r ReloadResult) {
+	results := make(chan reloadResult, 64)
+	w, err := newPeerWatcher(path, func(r reloadResult) {
 		select {
 		case results <- r:
 		default:
 		}
 	})
 	if err != nil {
-		t.Fatalf("NewPeerWatcher: %v", err)
+		t.Fatalf("newPeerWatcher: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -387,10 +387,10 @@ func TestConfigWatcherInitialLoadFailsClosed(t *testing.T) {
 	// Never start on a broken peer list: startup is the one place where
 	// there is no previous good config to keep.
 	path := tempFile(t, "peers.yaml", "peerz: []\n")
-	if _, err := NewPeerWatcher(path, nil); err == nil {
+	if _, err := newPeerWatcher(path, nil); err == nil {
 		t.Fatal("want error for a malformed initial peers file, got nil")
 	}
-	if _, err := NewPeerWatcher(filepath.Join(t.TempDir(), "absent.yaml"), nil); err == nil {
+	if _, err := newPeerWatcher(filepath.Join(t.TempDir(), "absent.yaml"), nil); err == nil {
 		t.Fatal("want error for a missing initial peers file, got nil")
 	}
 }
@@ -402,23 +402,23 @@ func TestConfigHotReloadHappyPath(t *testing.T) {
 
 	w, results := newTestWatcher(t, path)
 
-	if _, ok := w.Policy().Resolve(netip.MustParseAddr("10.99.0.8"), "cache"); ok {
+	if _, ok := w.policy().Resolve(netip.MustParseAddr("10.99.0.8"), "cache"); ok {
 		t.Fatal("policy granted access before the peer existed")
 	}
 
 	writeFile(t, path, onePeerYAML("app-02", testKey(2), "10.99.0.8", "cache", "192.0.2.11:6379"))
 
 	waitFor(t, "the new peer to be resolvable", func() bool {
-		_, ok := w.Policy().Resolve(netip.MustParseAddr("10.99.0.8"), "cache")
+		_, ok := w.policy().Resolve(netip.MustParseAddr("10.99.0.8"), "cache")
 		return ok
 	})
 
 	// The revoked peer is gone the moment the swap happens.
-	if _, ok := w.Policy().Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db"); ok {
+	if _, ok := w.policy().Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db"); ok {
 		t.Error("revoked peer still resolves after reload")
 	}
 
-	var got ReloadResult
+	var got reloadResult
 	waitFor(t, "a successful reload result", func() bool {
 		for {
 			select {
@@ -447,11 +447,11 @@ func TestConfigHotReloadMalformedKeepsPreviousPolicy(t *testing.T) {
 	writeFile(t, path, good)
 
 	w, results := newTestWatcher(t, path)
-	before := w.Policy()
+	before := w.policy()
 
 	writeFile(t, path, "peers:\n  - name: app-01\n    pubic_key: oops\n")
 
-	var failed ReloadResult
+	var failed reloadResult
 	waitFor(t, "a failed reload result", func() bool {
 		select {
 		case r := <-results:
@@ -472,21 +472,21 @@ func TestConfigHotReloadMalformedKeepsPreviousPolicy(t *testing.T) {
 	}
 
 	// The old policy is still in force: not cleared, not partially applied.
-	backend, ok := w.Policy().Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db")
+	backend, ok := w.policy().Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db")
 	if !ok || backend != netip.MustParseAddrPort("192.0.2.10:3306") {
 		t.Fatalf("previous policy no longer resolves after a malformed reload: %v, %v", backend, ok)
 	}
-	if w.Policy() != before {
+	if w.policy() != before {
 		t.Error("policy pointer changed on a failed reload")
 	}
-	if len(w.Config().Peers) != 1 {
-		t.Errorf("Config().Peers = %d, want the previous 1", len(w.Config().Peers))
+	if len(w.Config().peers) != 1 {
+		t.Errorf("Config().peers = %d, want the previous 1", len(w.Config().peers))
 	}
 
 	// And a later good write still gets picked up.
 	writeFile(t, path, onePeerYAML("app-02", testKey(2), "10.99.0.8", "cache", "192.0.2.11:6379"))
 	waitFor(t, "recovery after a malformed file", func() bool {
-		_, ok := w.Policy().Resolve(netip.MustParseAddr("10.99.0.8"), "cache")
+		_, ok := w.policy().Resolve(netip.MustParseAddr("10.99.0.8"), "cache")
 		return ok
 	})
 }
@@ -514,7 +514,7 @@ func TestConfigHotReloadSurvivesRename(t *testing.T) {
 			t.Fatalf("rename: %v", err)
 		}
 		waitFor(t, "the renamed-in file to be applied (round "+fmt.Sprint(i)+")", func() bool {
-			_, ok := w.Policy().Resolve(netip.MustParseAddr(spec.ip), spec.service)
+			_, ok := w.policy().Resolve(netip.MustParseAddr(spec.ip), spec.service)
 			return ok
 		})
 	}
@@ -527,13 +527,13 @@ func TestConfigHotReloadDebounced(t *testing.T) {
 
 	var mu sync.Mutex
 	var reloads int
-	w, err := NewPeerWatcher(path, func(ReloadResult) {
+	w, err := newPeerWatcher(path, func(reloadResult) {
 		mu.Lock()
 		reloads++
 		mu.Unlock()
 	})
 	if err != nil {
-		t.Fatalf("NewPeerWatcher: %v", err)
+		t.Fatalf("newPeerWatcher: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -544,7 +544,7 @@ func TestConfigHotReloadDebounced(t *testing.T) {
 		writeFile(t, path, onePeerYAML("app-02", testKey(2), "10.99.0.8", "cache", "192.0.2.11:6379"))
 	}
 	waitFor(t, "the burst to be applied", func() bool {
-		_, ok := w.Policy().Resolve(netip.MustParseAddr("10.99.0.8"), "cache")
+		_, ok := w.policy().Resolve(netip.MustParseAddr("10.99.0.8"), "cache")
 		return ok
 	})
 	time.Sleep(3 * reloadDebounce)
@@ -575,9 +575,9 @@ func TestConfigHotReloadConcurrentReads(t *testing.T) {
 					return
 				default:
 				}
-				p := w.Policy()
+				p := w.policy()
 				if p == nil {
-					t.Error("Policy() returned nil during a reload")
+					t.Error("policy() returned nil during a reload")
 					return
 				}
 				p.Resolve(netip.MustParseAddr("10.99.0.7"), "primary-db")
@@ -602,9 +602,9 @@ func TestConfigReloadDiffByPublicKey(t *testing.T) {
 	path := filepath.Join(dir, "peers.yaml")
 	writeFile(t, path, onePeerYAML("app-01", testKey(1), "10.99.0.7", "primary-db", "192.0.2.10:3306"))
 
-	w, err := NewPeerWatcher(path, nil)
+	w, err := newPeerWatcher(path, nil)
 	if err != nil {
-		t.Fatalf("NewPeerWatcher: %v", err)
+		t.Fatalf("newPeerWatcher: %v", err)
 	}
 	defer w.Close()
 
@@ -647,9 +647,9 @@ func TestConfigReloadDiffByPublicKey(t *testing.T) {
 
 func TestConfigWatcherCloseIsIdempotent(t *testing.T) {
 	path := tempFile(t, "peers.yaml", "peers: []\n")
-	w, err := NewPeerWatcher(path, nil)
+	w, err := newPeerWatcher(path, nil)
 	if err != nil {
-		t.Fatalf("NewPeerWatcher: %v", err)
+		t.Fatalf("newPeerWatcher: %v", err)
 	}
 	if err := w.Close(); err != nil {
 		t.Errorf("first Close: %v", err)

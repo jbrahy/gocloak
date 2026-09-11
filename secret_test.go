@@ -51,7 +51,7 @@ func TestSecretResolve(t *testing.T) {
 
 	t.Setenv("GOCLOAK_TEST_SECRET", "env-secret-value")
 
-	working := &SecretResolver{
+	working := &secretResolver{
 		sm: fakeSMClient{
 			out: &secretsmanager.GetSecretValueOutput{
 				SecretString: aws.String("sm-secret-value"),
@@ -66,7 +66,7 @@ func TestSecretResolve(t *testing.T) {
 		},
 	}
 
-	failing := &SecretResolver{
+	failing := &secretResolver{
 		sm:  fakeSMClient{err: errors.New("access denied")},
 		ssm: fakeSSMClient{err: errors.New("access denied")},
 	}
@@ -74,7 +74,7 @@ func TestSecretResolve(t *testing.T) {
 	tests := []struct {
 		name     string
 		ref      SecretRef
-		resolver *SecretResolver
+		resolver *secretResolver
 		want     string
 		wantErr  bool
 	}{
@@ -125,7 +125,7 @@ func TestSecretRejectsLooseFilePermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := &SecretResolver{}
+	r := &secretResolver{}
 	_, err := r.Resolve(context.Background(), SecretRef("file:"+loose))
 	if err == nil {
 		t.Fatalf("Resolve of a 0644 file did not error")
@@ -136,7 +136,7 @@ func TestSecretRejectsLooseFilePermissions(t *testing.T) {
 // case the brief requires: an unrecognized scheme must error, never fall
 // back to treating the reference as a literal value.
 func TestSecretRejectsUnknownScheme(t *testing.T) {
-	r := &SecretResolver{}
+	r := &secretResolver{}
 	got, err := r.Resolve(context.Background(), "http:not-a-real-scheme")
 	if err == nil {
 		t.Fatalf("Resolve of an unknown scheme did not error, got %v", got)
@@ -154,7 +154,7 @@ func TestSecretRejectsUnknownScheme(t *testing.T) {
 // plaintext, to actually catch that case.
 func TestSecretStringRedacted(t *testing.T) {
 	const want = "[REDACTED]"
-	s := Secret{value: []byte("top-secret-value")}
+	s := secret{value: []byte("top-secret-value")}
 	p := &s
 
 	cases := []struct {
@@ -163,12 +163,12 @@ func TestSecretStringRedacted(t *testing.T) {
 	}{
 		{"value %v", fmt.Sprintf("%v", s)},
 		//lint:ignore S1025 deliberately exercising fmt's %s verb to confirm it
-		// routes through Secret's Stringer instead of calling String() directly
+		// routes through secret's Stringer instead of calling String() directly
 		{"value %s", fmt.Sprintf("%s", s)},
 		{"value %#v", fmt.Sprintf("%#v", s)},
 		{"pointer %v", fmt.Sprintf("%v", p)},
 		//lint:ignore S1025 deliberately exercising fmt's %s verb to confirm it
-		// routes through Secret's Stringer instead of calling String() directly
+		// routes through secret's Stringer instead of calling String() directly
 		{"pointer %s", fmt.Sprintf("%s", p)},
 		{"pointer %#v", fmt.Sprintf("%#v", p)},
 	}

@@ -21,12 +21,12 @@ func TestWireRoundTrip(t *testing.T) {
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
 			var buf bytes.Buffer
-			if err := WriteHelloRequest(&buf, name); err != nil {
-				t.Fatalf("WriteHelloRequest: %v", err)
+			if err := writeHelloRequest(&buf, name); err != nil {
+				t.Fatalf("writeHelloRequest: %v", err)
 			}
-			got, err := ReadHelloRequest(&buf)
+			got, err := readHelloRequest(&buf)
 			if err != nil {
-				t.Fatalf("ReadHelloRequest: %v", err)
+				t.Fatalf("readHelloRequest: %v", err)
 			}
 			if got != name {
 				t.Fatalf("got name %q, want %q", got, name)
@@ -42,7 +42,7 @@ func TestWireRoundTrip(t *testing.T) {
 // never written to the wire at all.
 func TestWireWriteRequestRejectsInvalidName(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteHelloRequest(&buf, "Not Valid!"); err == nil {
+	if err := writeHelloRequest(&buf, "Not Valid!"); err == nil {
 		t.Fatal("expected error for invalid name, got nil")
 	}
 	if buf.Len() != 0 {
@@ -51,7 +51,7 @@ func TestWireWriteRequestRejectsInvalidName(t *testing.T) {
 }
 
 // TestWireReadRequestTable is table-driven over malformed and valid raw frames,
-// built by hand so we can exercise cases WriteHelloRequest would refuse to
+// built by hand so we can exercise cases writeHelloRequest would refuse to
 // produce (like an oversized declared length or a mismatched name length).
 func TestWireReadRequestTable(t *testing.T) {
 	tests := []struct {
@@ -139,7 +139,7 @@ func TestWireReadRequestTable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ReadHelloRequest(bytes.NewReader(tt.frame))
+			got, err := readHelloRequest(bytes.NewReader(tt.frame))
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got name %q", got)
@@ -158,8 +158,8 @@ func TestWireReadRequestTable(t *testing.T) {
 
 // TestWireReadRequestMalformedIsErrMalformedFrame asserts that validation
 // failures (as opposed to plain I/O failures) are identifiable via
-// errors.Is(err, ErrMalformedFrame), which server.go needs to decide
-// whether to answer with StatusMalformed before closing.
+// errors.Is(err, errMalformedFrame), which server.go needs to decide
+// whether to answer with statusMalformed before closing.
 func TestWireReadRequestMalformedIsErrMalformedFrame(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -173,12 +173,12 @@ func TestWireReadRequestMalformedIsErrMalformedFrame(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := ReadHelloRequest(bytes.NewReader(tt.frame))
+			_, err := readHelloRequest(bytes.NewReader(tt.frame))
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
-			if !errors.Is(err, ErrMalformedFrame) {
-				t.Fatalf("expected errors.Is(err, ErrMalformedFrame), got: %v", err)
+			if !errors.Is(err, errMalformedFrame) {
+				t.Fatalf("expected errors.Is(err, errMalformedFrame), got: %v", err)
 			}
 		})
 	}
@@ -190,7 +190,7 @@ func TestWireReadRequestMalformedIsErrMalformedFrame(t *testing.T) {
 func TestWireReadRequestNeverEchoesPayload(t *testing.T) {
 	marker := "UNIQUE-CANARY-VALUE"
 	frame := append([]byte{0x01, byte(len(marker))}, []byte(marker)...)
-	_, err := ReadHelloRequest(bytes.NewReader(frame))
+	_, err := readHelloRequest(bytes.NewReader(frame))
 	if err == nil {
 		t.Fatal("expected error for invalid charset (uppercase canary), got nil")
 	}
@@ -200,24 +200,24 @@ func TestWireReadRequestNeverEchoesPayload(t *testing.T) {
 }
 
 // TestWireStatusRoundTrip covers every defined status code through
-// WriteHelloResponse and ReadHelloResponse.
+// writeHelloResponse and readHelloResponse.
 func TestWireStatusRoundTrip(t *testing.T) {
-	statuses := []Status{
-		StatusOK,
-		StatusDenied,
-		StatusBackendUnavailable,
-		StatusRateLimited,
-		StatusMalformed,
+	statuses := []status{
+		statusOK,
+		statusDenied,
+		statusBackendUnavailable,
+		statusRateLimited,
+		statusMalformed,
 	}
 	for _, status := range statuses {
 		t.Run(status.String(), func(t *testing.T) {
 			var buf bytes.Buffer
-			if err := WriteHelloResponse(&buf, status); err != nil {
-				t.Fatalf("WriteHelloResponse: %v", err)
+			if err := writeHelloResponse(&buf, status); err != nil {
+				t.Fatalf("writeHelloResponse: %v", err)
 			}
-			got, err := ReadHelloResponse(&buf)
+			got, err := readHelloResponse(&buf)
 			if err != nil {
-				t.Fatalf("ReadHelloResponse: %v", err)
+				t.Fatalf("readHelloResponse: %v", err)
 			}
 			if got != status {
 				t.Fatalf("got status %v, want %v", got, status)
@@ -230,12 +230,12 @@ func TestWireStatusRoundTrip(t *testing.T) {
 // byte is an error, never a silent success.
 func TestWireReadResponseUnknownStatus(t *testing.T) {
 	frame := []byte{0x01, 0x05} // 0x05 is not a defined status
-	_, err := ReadHelloResponse(bytes.NewReader(frame))
+	_, err := readHelloResponse(bytes.NewReader(frame))
 	if err == nil {
 		t.Fatal("expected error for unknown status byte, got nil")
 	}
-	if !errors.Is(err, ErrMalformedFrame) {
-		t.Fatalf("expected errors.Is(err, ErrMalformedFrame), got: %v", err)
+	if !errors.Is(err, errMalformedFrame) {
+		t.Fatalf("expected errors.Is(err, errMalformedFrame), got: %v", err)
 	}
 }
 
@@ -243,7 +243,7 @@ func TestWireReadResponseUnknownStatus(t *testing.T) {
 // byte is validated too.
 func TestWireReadResponseWrongVersion(t *testing.T) {
 	frame := []byte{0x02, 0x00}
-	_, err := ReadHelloResponse(bytes.NewReader(frame))
+	_, err := readHelloResponse(bytes.NewReader(frame))
 	if err == nil {
 		t.Fatal("expected error for wrong version, got nil")
 	}
@@ -253,7 +253,7 @@ func TestWireReadResponseWrongVersion(t *testing.T) {
 // puts an undefined status byte on the wire.
 func TestWireWriteResponseRejectsUnknownStatus(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteHelloResponse(&buf, Status(0x99)); err == nil {
+	if err := writeHelloResponse(&buf, status(0x99)); err == nil {
 		t.Fatal("expected error for unknown status, got nil")
 	}
 	if buf.Len() != 0 {
@@ -265,19 +265,19 @@ func TestWireWriteResponseRejectsUnknownStatus(t *testing.T) {
 // unrecognized value.
 func TestWireStatusString(t *testing.T) {
 	tests := []struct {
-		status Status
+		status status
 		want   string
 	}{
-		{StatusOK, "ok"},
-		{StatusDenied, "denied"},
-		{StatusBackendUnavailable, "backend unavailable"},
-		{StatusRateLimited, "rate limited"},
-		{StatusMalformed, "malformed request"},
-		{Status(0x42), "unknown status 0x42"},
+		{statusOK, "ok"},
+		{statusDenied, "denied"},
+		{statusBackendUnavailable, "backend unavailable"},
+		{statusRateLimited, "rate limited"},
+		{statusMalformed, "malformed request"},
+		{status(0x42), "unknown status 0x42"},
 	}
 	for _, tt := range tests {
 		if got := tt.status.String(); got != tt.want {
-			t.Errorf("Status(%d).String() = %q, want %q", tt.status, got, tt.want)
+			t.Errorf("status(%d).String() = %q, want %q", tt.status, got, tt.want)
 		}
 	}
 }
@@ -341,9 +341,9 @@ func TestWireReadRequestSlowReader(t *testing.T) {
 	data := append(append([]byte{}, frame...), trailing...)
 
 	sr := &slowReader{data: data}
-	got, err := ReadHelloRequest(sr)
+	got, err := readHelloRequest(sr)
 	if err != nil {
-		t.Fatalf("ReadHelloRequest: %v", err)
+		t.Fatalf("readHelloRequest: %v", err)
 	}
 	if got != name {
 		t.Fatalf("got %q, want %q", got, name)
@@ -358,7 +358,7 @@ func TestWireReadRequestSlowReader(t *testing.T) {
 }
 
 // TestWireReadRequestNoOverread asserts, using a plain
-// bytes.Reader, that ReadHelloRequest consumes exactly the frame's bytes
+// bytes.Reader, that readHelloRequest consumes exactly the frame's bytes
 // and leaves anything after it untouched in the reader.
 func TestWireReadRequestNoOverread(t *testing.T) {
 	name := "svc"
@@ -368,9 +368,9 @@ func TestWireReadRequestNoOverread(t *testing.T) {
 	data := append(append([]byte{}, frame...), trailing...)
 
 	r := bytes.NewReader(data)
-	got, err := ReadHelloRequest(r)
+	got, err := readHelloRequest(r)
 	if err != nil {
-		t.Fatalf("ReadHelloRequest: %v", err)
+		t.Fatalf("readHelloRequest: %v", err)
 	}
 	if got != name {
 		t.Fatalf("got %q, want %q", got, name)

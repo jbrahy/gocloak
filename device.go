@@ -46,10 +46,10 @@ type deviceOptions struct {
 
 	// PrivateKey is this device's Curve25519 private key, base64
 	// encoded, which is the form wg(8) and wg-quick use and therefore
-	// the form an operator stores in a secret store. It is a Secret
+	// the form an operator stores in a secret store. It is a secret
 	// rather than a string so that a %v or %+v on these options prints
 	// a placeholder instead of the key (constraint 4).
-	PrivateKey Secret
+	PrivateKey secret
 
 	// ListenPort is the UDP port to bind. The server sets its
 	// configured port; a client passes 0 and gets an ephemeral port.
@@ -76,8 +76,8 @@ type devicePeer struct {
 	// key, base64 encoded. It is required, never optional: spec section
 	// 7.1 lists the PSK as the post-quantum hedge, so a peer configured
 	// without one must fail rather than come up weaker than designed.
-	// It is a Secret so a %v on this struct cannot print it.
-	PresharedKey Secret
+	// It is a secret so a %v on this struct cannot print it.
+	PresharedKey secret
 
 	// AllowedIP is the single tunnel address this peer is permitted to
 	// source packets from, always applied as a /32. It is deliberately
@@ -128,8 +128,8 @@ func newTunnelDevice(opts deviceOptions) (*tunnelDevice, error) {
 	if mtu == 0 {
 		mtu = DefaultMTU
 	}
-	if mtu < MinMTU || mtu > MaxMTU {
-		return nil, fmt.Errorf("gocloak: device: mtu %d is not in %d-%d", mtu, MinMTU, MaxMTU)
+	if mtu < minMTU || mtu > maxMTU {
+		return nil, fmt.Errorf("gocloak: device: mtu %d is not in %d-%d", mtu, minMTU, maxMTU)
 	}
 
 	privateKey, err := keyToHex(string(opts.PrivateKey.bytes()))

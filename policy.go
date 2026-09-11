@@ -6,12 +6,12 @@ import (
 	"net/netip"
 )
 
-// PeerPolicy describes one peer's tunnel identity and the services it may
-// reach. It is the input to NewPolicy. config.go (task 5) decodes peers.yaml
-// and builds PeerPolicy values from it; this package has no dependency on
+// peerPolicy describes one peer's tunnel identity and the services it may
+// reach. It is the input to newPolicy. config.go (task 5) decodes peers.yaml
+// and builds peerPolicy values from it; this package has no dependency on
 // config.go or on YAML, so a plain Go literal builds a complete input
 // without any fixture file.
-type PeerPolicy struct {
+type peerPolicy struct {
 	// TunnelIP is the peer's WireGuard tunnel address. Per spec section
 	// 3.2, cryptokey routing binds this address to the peer's keypair, so
 	// it is the authenticated identity a lookup keys off, not a claim the
@@ -24,27 +24,27 @@ type PeerPolicy struct {
 	Allow map[string]netip.AddrPort
 }
 
-// Policy is the authorization engine: it answers, for a given peer tunnel IP
+// policy is the authorization engine: it answers, for a given peer tunnel IP
 // and service name, which backend address (if any) that peer may reach.
 //
-// A Policy is immutable once built by NewPolicy: there is no exported
+// A policy is immutable once built by newPolicy: there is no exported
 // mutator, no exported map, and no method that hands out a reference to an
-// internal map a caller could write through. This makes a *Policy value
+// internal map a caller could write through. This makes a *policy value
 // safe to share across goroutines by construction, which is required
 // because task 7's server reads it concurrently while task 5's hot reload
-// swaps a new *Policy in atomically.
-type Policy struct {
+// swaps a new *policy in atomically.
+type policy struct {
 	peers map[netip.Addr]map[string]netip.AddrPort
 }
 
-// NewPolicy builds a Policy from peer definitions, validating everything at
-// construction time. A *Policy that exists is safe to consult: a duplicate
+// newPolicy builds a policy from peer definitions, validating everything at
+// construction time. A *policy that exists is safe to consult: a duplicate
 // tunnel IP across two peers, an unspecified or zero tunnel IP, an invalid
 // service name, or an invalid backend address all fail construction rather
 // than being accepted and only discovered wrong at lookup time. On error,
-// NewPolicy returns a nil *Policy: there is no partially built value to
+// newPolicy returns a nil *policy: there is no partially built value to
 // accidentally consult.
-func NewPolicy(peers []PeerPolicy) (*Policy, error) {
+func newPolicy(peers []peerPolicy) (*policy, error) {
 	m := make(map[netip.Addr]map[string]netip.AddrPort, len(peers))
 
 	for _, p := range peers {
@@ -76,7 +76,7 @@ func NewPolicy(peers []PeerPolicy) (*Policy, error) {
 		m[tunnelIP] = allow
 	}
 
-	return &Policy{peers: m}, nil
+	return &policy{peers: m}, nil
 }
 
 // Resolve returns the backend address that peerTunnelIP is authorized to
@@ -85,10 +85,10 @@ func NewPolicy(peers []PeerPolicy) (*Policy, error) {
 // granted are indistinguishable in the returned decision: both yield
 // (netip.AddrPort{}, false). Callers must check the bool; the zero
 // netip.AddrPort is never a valid grant.
-func (p *Policy) Resolve(peerTunnelIP netip.Addr, serviceName string) (netip.AddrPort, bool) {
+func (p *policy) Resolve(peerTunnelIP netip.Addr, serviceName string) (netip.AddrPort, bool) {
 	// Unmap so an IPv4-in-IPv6 spelling of a tunnel IP (as conn.RemoteAddr
 	// may yield) resolves identically to its IPv4 form, matching how
-	// NewPolicy normalizes keys at construction.
+	// newPolicy normalizes keys at construction.
 	allow, ok := p.peers[peerTunnelIP.Unmap()]
 	if !ok {
 		return netip.AddrPort{}, false

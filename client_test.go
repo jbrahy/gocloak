@@ -238,13 +238,13 @@ func TestClientBackendUnavailableIsADistinctError(t *testing.T) {
 // cannot provoke against a real server.
 func TestClientStatusErrorsAreDistinctSentinels(t *testing.T) {
 	cases := []struct {
-		status Status
+		status status
 		want   error
 	}{
-		{StatusDenied, ErrDenied},
-		{StatusBackendUnavailable, ErrBackendUnavailable},
-		{StatusRateLimited, ErrRateLimited},
-		{StatusMalformed, ErrMalformedRequest},
+		{statusDenied, ErrDenied},
+		{statusBackendUnavailable, ErrBackendUnavailable},
+		{statusRateLimited, ErrRateLimited},
+		{statusMalformed, ErrMalformedRequest},
 	}
 	all := []error{ErrDenied, ErrBackendUnavailable, ErrRateLimited, ErrMalformedRequest, ErrHandshakeTimeout}
 
@@ -269,9 +269,9 @@ func TestClientStatusErrorsAreDistinctSentinels(t *testing.T) {
 		}
 	}
 
-	// StatusOK is not an error, and must never be turned into one.
-	if err := statusError(StatusOK, "svc"); err != nil {
-		t.Errorf("statusError(StatusOK) = %v, want nil", err)
+	// statusOK is not an error, and must never be turned into one.
+	if err := statusError(statusOK, "svc"); err != nil {
+		t.Errorf("statusError(statusOK) = %v, want nil", err)
 	}
 }
 
@@ -697,11 +697,11 @@ func TestClientHelloIsBoundedByTheDialBudget(t *testing.T) {
 
 	loose, cancelLoose := context.WithTimeout(context.Background(), time.Hour)
 	defer cancelLoose()
-	if d := c.helloDeadline(loose); d.After(time.Now().Add(HelloReadDeadline)) {
-		t.Errorf("helloDeadline is %v away on an hour long budget; it must not exceed HelloReadDeadline", time.Until(d))
+	if d := c.helloDeadline(loose); d.After(time.Now().Add(helloReadDeadline)) {
+		t.Errorf("helloDeadline is %v away on an hour long budget; it must not exceed helloReadDeadline", time.Until(d))
 	}
-	if d := c.helloDeadline(loose); d.Before(time.Now().Add(HelloReadDeadline - time.Second)) {
-		t.Errorf("helloDeadline is only %v away on an hour long budget; it should be HelloReadDeadline", time.Until(d))
+	if d := c.helloDeadline(loose); d.Before(time.Now().Add(helloReadDeadline - time.Second)) {
+		t.Errorf("helloDeadline is only %v away on an hour long budget; it should be helloReadDeadline", time.Until(d))
 	}
 
 	// End to end over a pipe: a far end that takes the request and then
@@ -813,7 +813,7 @@ func TestClientDialUnderRepeatedCancellationNeverReturnsADeadConn(t *testing.T) 
 	// The default rate cap is 10 dials per second, which this test would
 	// spend its whole budget waiting on.
 	h := clientTestStart(t, map[string]string{"echo": backend.String()}, func(p *serverTestPeer) {
-		p.Limits = PeerLimits{MaxConcurrent: 64, DialsPerSecond: 5000}
+		p.Limits = peerLimits{MaxConcurrent: 64, DialsPerSecond: 5000}
 	})
 
 	c := h.client()

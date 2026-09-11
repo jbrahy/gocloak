@@ -30,12 +30,12 @@ const (
 	// section 8.2 fixes it at 1280, the IPv6 minimum, because a too-large
 	// MTU blackholes TCP silently.
 	DefaultMTU = 1280
-	// MinMTU is the smallest accepted MTU: below the IPv6 minimum, the
+	// minMTU is the smallest accepted MTU: below the IPv6 minimum, the
 	// tunnel cannot carry a conforming packet.
-	MinMTU = 1280
-	// MaxMTU is the largest accepted MTU. A tunnel MTU above a standard
+	minMTU = 1280
+	// maxMTU is the largest accepted MTU. A tunnel MTU above a standard
 	// Ethernet MTU cannot survive a path across the public internet.
-	MaxMTU = 1500
+	maxMTU = 1500
 
 	// DefaultMaxConcurrent is the per-peer concurrent stream cap applied
 	// when a peer omits limits.
@@ -91,7 +91,7 @@ type serverYAML struct {
 	LogFormat  string    `yaml:"log_format"`
 }
 
-// ServerFileConfig is the validated content of server.yaml. Secret-bearing
+// ServerFileConfig is the validated content of server.yaml. secret-bearing
 // fields hold references, not values: decoding never contacts a secret
 // store, so the server resolves PrivateKey at startup and a config test
 // needs no AWS.
@@ -146,8 +146,8 @@ func LoadServerConfig(path string) (*ServerFileConfig, error) {
 	if cfg.MTU == 0 {
 		cfg.MTU = DefaultMTU
 	}
-	if cfg.MTU < MinMTU || cfg.MTU > MaxMTU {
-		return nil, fmt.Errorf("gocloak: config: %s: mtu %d is not in %d-%d", path, cfg.MTU, MinMTU, MaxMTU)
+	if cfg.MTU < minMTU || cfg.MTU > maxMTU {
+		return nil, fmt.Errorf("gocloak: config: %s: mtu %d is not in %d-%d", path, cfg.MTU, minMTU, maxMTU)
 	}
 
 	if cfg.PeersFile == "" {
@@ -187,31 +187,31 @@ type limitsYAML struct {
 	DialsPerSecond int `yaml:"dials_per_second"`
 }
 
-// PeerLimits are the per-peer caps from spec section 8.2's abusive peer row.
-type PeerLimits struct {
+// peerLimits are the per-peer caps from spec section 8.2's abusive peer row.
+type peerLimits struct {
 	MaxConcurrent  int
 	DialsPerSecond int
 }
 
-// PeerConfig is one validated peer entry from peers.yaml. PSK holds a
-// reference, never resolved key material, so a PeerConfig can be compared,
+// peerConfig is one validated peer entry from peers.yaml. PSK holds a
+// reference, never resolved key material, so a peerConfig can be compared,
 // diffed and passed around without any secret in it.
 //
-// A PeerConfig handed out by a PeerWatcher is immutable by contract: it is
+// A peerConfig handed out by a peerWatcher is immutable by contract: it is
 // shared with every other reader of the same reload, so callers must treat
 // it, and the Allow map inside it, as read-only.
-type PeerConfig struct {
+type peerConfig struct {
 	Name      string
 	PublicKey string // base64 Curve25519, validated to decode to 32 bytes
 	PSK       SecretRef
 	TunnelIP  netip.Addr
-	Limits    PeerLimits
+	Limits    peerLimits
 	Allow     map[string]netip.AddrPort
 }
 
 // equal reports whether two peer entries are identical in every field that
 // the server acts on, so an unchanged entry is not reported as changed.
-func (p PeerConfig) equal(o PeerConfig) bool {
+func (p peerConfig) equal(o peerConfig) bool {
 	return p.Name == o.Name &&
 		p.PublicKey == o.PublicKey &&
 		p.PSK == o.PSK &&
@@ -221,17 +221,22 @@ func (p PeerConfig) equal(o PeerConfig) bool {
 }
 
 // PeersConfig is the validated content of peers.yaml together with the
-// Policy built from it. It is produced whole or not at all: a PeersConfig
+// policy built from it. It is produced whole or not at all: a PeersConfig
 // that exists has already passed every check, so there is never a
 // half-built value in circulation.
+//
+// It is exported because LoadPeersConfig returns it and a caller has to be
+// able to name that. Its contents are not: the peer list holds public keys
+// and secret references, and no consumer outside this package has a reason
+// to read them.
 type PeersConfig struct {
-	Peers  []PeerConfig
-	Policy *Policy
+	peers  []peerConfig
+	policy *policy
 }
 
 // peerNames returns the peer names in order, for logging. Only names, never
 // key material, belong in a log line.
-func peerNames(peers []PeerConfig) []string {
+func peerNames(peers []peerConfig) []string {
 	names := make([]string, 0, len(peers))
 	for _, p := range peers {
 		names = append(names, p.Name)
@@ -240,7 +245,7 @@ func peerNames(peers []PeerConfig) []string {
 }
 
 // LoadPeersConfig reads, decodes and fully validates peers.yaml, then builds
-// the Policy. Any error means nothing is returned: the caller keeps whatever
+// the policy. Any error means nothing is returned: the caller keeps whatever
 // it already had.
 //
 // An empty peers list is valid and means nobody may connect. An empty file
@@ -257,7 +262,7 @@ func LoadPeersConfig(path string) (*PeersConfig, error) {
 		return nil, fmt.Errorf("gocloak: config: %s: %w", path, err)
 	}
 
-	peers := make([]PeerConfig, 0, len(raw.Peers))
+	peers := make([]peerConfig, 0, len(raw.Peers))
 	names := make(map[string]struct{}, len(raw.Peers))
 	keys := make(map[string]struct{}, len(raw.Peers))
 	ips := make(map[netip.Addr]struct{}, len(raw.Peers))
@@ -282,59 +287,59 @@ func LoadPeersConfig(path string) (*PeersConfig, error) {
 		peers = append(peers, p)
 	}
 
-	policies := make([]PeerPolicy, 0, len(peers))
+	policies := make([]peerPolicy, 0, len(peers))
 	for _, p := range peers {
-		policies = append(policies, PeerPolicy{TunnelIP: p.TunnelIP, Allow: p.Allow})
+		policies = append(policies, peerPolicy{TunnelIP: p.TunnelIP, Allow: p.Allow})
 	}
-	policy, err := NewPolicy(policies)
+	policy, err := newPolicy(policies)
 	if err != nil {
 		return nil, fmt.Errorf("gocloak: config: %s: %w", path, err)
 	}
 
-	return &PeersConfig{Peers: peers, Policy: policy}, nil
+	return &PeersConfig{peers: peers, policy: policy}, nil
 }
 
-// validatePeer turns one raw YAML peer entry into a validated PeerConfig.
+// validatePeer turns one raw YAML peer entry into a validated peerConfig.
 // Every check that can be made without contacting a secret store is made
 // here, at load time, so a bad entry can never reach a lookup.
-func validatePeer(rp peerYAML) (PeerConfig, error) {
+func validatePeer(rp peerYAML) (peerConfig, error) {
 	// The peer name reaches log lines, so it is held to the same charset
 	// as a service name: no control characters, no spaces, nothing that
 	// could forge a second field in a log record.
 	if rp.Name == "" {
-		return PeerConfig{}, errors.New("name is required")
+		return peerConfig{}, errors.New("name is required")
 	}
 	if !ValidServiceName(rp.Name) {
-		return PeerConfig{}, errors.New("name must match [a-z0-9][a-z0-9-]{0,62}")
+		return peerConfig{}, errors.New("name must match [a-z0-9][a-z0-9-]{0,62}")
 	}
 
 	if err := validPublicKey(rp.PublicKey); err != nil {
-		return PeerConfig{}, fmt.Errorf("peer %s: public_key: %w", rp.Name, err)
+		return peerConfig{}, fmt.Errorf("peer %s: public_key: %w", rp.Name, err)
 	}
 	if err := validSecretRef(rp.PSK); err != nil {
-		return PeerConfig{}, fmt.Errorf("peer %s: psk: %w", rp.Name, err)
+		return peerConfig{}, fmt.Errorf("peer %s: psk: %w", rp.Name, err)
 	}
 
 	addr, err := parseTunnelIP(rp.TunnelIP)
 	if err != nil {
-		return PeerConfig{}, fmt.Errorf("peer %s: tunnel_ip: %w", rp.Name, err)
+		return peerConfig{}, fmt.Errorf("peer %s: tunnel_ip: %w", rp.Name, err)
 	}
 	if !tunnelSubnet.Contains(addr) {
-		return PeerConfig{}, fmt.Errorf("peer %s: tunnel_ip %s is outside the tunnel subnet %s", rp.Name, addr, tunnelSubnet)
+		return peerConfig{}, fmt.Errorf("peer %s: tunnel_ip %s is outside the tunnel subnet %s", rp.Name, addr, tunnelSubnet)
 	}
 	if addr == serverTunnelIP {
-		return PeerConfig{}, fmt.Errorf("peer %s: tunnel_ip %s is the server address", rp.Name, addr)
+		return peerConfig{}, fmt.Errorf("peer %s: tunnel_ip %s is the server address", rp.Name, addr)
 	}
 	if addr == tunnelSubnet.Masked().Addr() || addr == subnetBroadcast(tunnelSubnet) {
-		return PeerConfig{}, fmt.Errorf("peer %s: tunnel_ip %s is not a host address in %s", rp.Name, addr, tunnelSubnet)
+		return peerConfig{}, fmt.Errorf("peer %s: tunnel_ip %s is not a host address in %s", rp.Name, addr, tunnelSubnet)
 	}
 
-	limits := PeerLimits{
+	limits := peerLimits{
 		MaxConcurrent:  rp.Limits.MaxConcurrent,
 		DialsPerSecond: rp.Limits.DialsPerSecond,
 	}
 	if limits.MaxConcurrent < 0 || limits.DialsPerSecond < 0 {
-		return PeerConfig{}, fmt.Errorf("peer %s: limits must not be negative", rp.Name)
+		return peerConfig{}, fmt.Errorf("peer %s: limits must not be negative", rp.Name)
 	}
 	if limits.MaxConcurrent == 0 {
 		limits.MaxConcurrent = DefaultMaxConcurrent
@@ -348,21 +353,21 @@ func validatePeer(rp peerYAML) (PeerConfig, error) {
 		if !ValidServiceName(name) {
 			// The name is not echoed: it has not passed validation, so
 			// it must not reach a log or error line.
-			return PeerConfig{}, fmt.Errorf("peer %s: allow: invalid service name", rp.Name)
+			return peerConfig{}, fmt.Errorf("peer %s: allow: invalid service name", rp.Name)
 		}
 		ap, err := netip.ParseAddrPort(backend)
 		if err != nil {
 			// Names are not resolved anywhere in this project, so a
 			// hostname here is an error, not a lookup.
-			return PeerConfig{}, fmt.Errorf("peer %s: allow: %s: backend must be a literal ip:port", rp.Name, name)
+			return peerConfig{}, fmt.Errorf("peer %s: allow: %s: backend must be a literal ip:port", rp.Name, name)
 		}
 		if !ap.IsValid() || ap.Port() == 0 {
-			return PeerConfig{}, fmt.Errorf("peer %s: allow: %s: backend port must not be zero", rp.Name, name)
+			return peerConfig{}, fmt.Errorf("peer %s: allow: %s: backend port must not be zero", rp.Name, name)
 		}
 		allow[name] = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 	}
 
-	return PeerConfig{
+	return peerConfig{
 		Name:      rp.Name,
 		PublicKey: rp.PublicKey,
 		PSK:       rp.PSK,
@@ -529,7 +534,7 @@ func yamlLinePrefix(msg string) string {
 // parseTunnelIP parses a tunnel address and normalizes it. An IPv4-in-IPv6
 // mapped spelling does not compare equal to its plain IPv4 form under
 // netip.Addr equality, so Unmap runs here, once, before the address is used
-// as a map key or handed to NewPolicy. Without it, two spellings of one
+// as a map key or handed to newPolicy. Without it, two spellings of one
 // address would slip past the duplicate check.
 func parseTunnelIP(s string) (netip.Addr, error) {
 	if s == "" {
@@ -593,30 +598,30 @@ func validSecretRef(ref SecretRef) error {
 // hot reload
 // ---------------------------------------------------------------------------
 
-// PeerDiff is the change between the peer list previously in force and the
+// peerDiff is the change between the peer list previously in force and the
 // one just loaded, keyed by public key because that is the identity the
 // WireGuard device uses. A peer that keeps its key and changes anything
 // else is Changed; a peer that gets a new key appears as one Removed (with
 // its old key) plus one Added.
-type PeerDiff struct {
-	Added   []PeerConfig
-	Removed []PeerConfig // the previous entries, so their old keys are available
+type peerDiff struct {
+	Added   []peerConfig
+	Removed []peerConfig // the previous entries, so their old keys are available
 	// Changed carries only the NEW entry, not the previous one, so a
 	// consumer cannot compute an old-versus-new allowed-ip delta from it
 	// and must apply it with replace_allowed_ips=true. That is the correct
 	// WireGuard idiom regardless: it makes the device's allowed-ip set
 	// match the file rather than accumulate stale entries.
-	Changed []PeerConfig
+	Changed []peerConfig
 }
 
 // IsEmpty reports whether the reload changed nothing.
-func (d PeerDiff) IsEmpty() bool {
+func (d peerDiff) IsEmpty() bool {
 	return len(d.Added) == 0 && len(d.Removed) == 0 && len(d.Changed) == 0
 }
 
 // diffPeers computes the change from prev to next, keyed by public key.
-func diffPeers(prev, next []PeerConfig) PeerDiff {
-	prevByKey := make(map[string]PeerConfig, len(prev))
+func diffPeers(prev, next []peerConfig) peerDiff {
+	prevByKey := make(map[string]peerConfig, len(prev))
 	for _, p := range prev {
 		prevByKey[p.PublicKey] = p
 	}
@@ -625,7 +630,7 @@ func diffPeers(prev, next []PeerConfig) PeerDiff {
 		nextByKey[p.PublicKey] = struct{}{}
 	}
 
-	var d PeerDiff
+	var d peerDiff
 	for _, p := range next {
 		old, ok := prevByKey[p.PublicKey]
 		switch {
@@ -643,11 +648,11 @@ func diffPeers(prev, next []PeerConfig) PeerDiff {
 	return d
 }
 
-// ReloadResult reports the outcome of one reload attempt. It carries what a
+// reloadResult reports the outcome of one reload attempt. It carries what a
 // log line may say (a path, a count, peer names) and what the server needs
 // to apply the change to the live WireGuard device (the diff). It never
 // carries key material.
-type ReloadResult struct {
+type reloadResult struct {
 	Path string
 	// Err is nil on success. On any error the previous good config stays
 	// in force: nothing is cleared and nothing is partially applied.
@@ -656,18 +661,18 @@ type ReloadResult struct {
 	// the previous count.
 	PeerCount int
 	// Diff is empty on an error.
-	Diff PeerDiff
+	Diff peerDiff
 }
 
-// PeerWatcher holds the peer list currently in force and swaps in a new one
+// peerWatcher holds the peer list currently in force and swaps in a new one
 // when peers.yaml changes. The swap is atomic: a reader either sees the
 // whole previous config or the whole new one, never a mixture, and never a
 // half-built value.
-type PeerWatcher struct {
+type peerWatcher struct {
 	path     string
 	dir      string
 	base     string
-	onReload func(ReloadResult)
+	onReload func(reloadResult)
 
 	cur atomic.Pointer[PeersConfig]
 
@@ -695,7 +700,7 @@ func statFileID(path string) fileID {
 	return fileID{size: fi.Size(), modTime: fi.ModTime()}
 }
 
-// NewPeerWatcher loads path, builds the first Policy, and arms a filesystem
+// newPeerWatcher loads path, builds the first policy, and arms a filesystem
 // watch. It fails if the initial file is missing or invalid: startup is the
 // one moment with no previous good config to fall back to, and spec section
 // 8.2 requires never starting on a stale or unvalidated peer list.
@@ -706,7 +711,7 @@ func statFileID(path string) fileID {
 //
 // Call Run to service filesystem events. Call Close when done, even if Run
 // is never called.
-func NewPeerWatcher(path string, onReload func(ReloadResult)) (*PeerWatcher, error) {
+func newPeerWatcher(path string, onReload func(reloadResult)) (*peerWatcher, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("gocloak: config: %s: %w", path, err)
@@ -721,7 +726,7 @@ func NewPeerWatcher(path string, onReload func(ReloadResult)) (*PeerWatcher, err
 		return nil, err
 	}
 
-	w := &PeerWatcher{
+	w := &peerWatcher{
 		path:     abs,
 		dir:      filepath.Dir(abs),
 		base:     filepath.Base(abs),
@@ -747,22 +752,22 @@ func NewPeerWatcher(path string, onReload func(ReloadResult)) (*PeerWatcher, err
 	return w, nil
 }
 
-// Policy returns the policy currently in force. It is lock-free and always
-// returns a fully-formed Policy, so a reader may call it concurrently with
+// policy returns the policy currently in force. It is lock-free and always
+// returns a fully-formed policy, so a reader may call it concurrently with
 // a reload. Hold the returned pointer for the duration of one decision
 // rather than calling twice, so a decision cannot straddle a swap.
-func (w *PeerWatcher) Policy() *Policy {
-	return w.cur.Load().Policy
+func (w *peerWatcher) policy() *policy {
+	return w.cur.Load().policy
 }
 
 // Config returns the peer configuration currently in force. The returned
 // value and everything reachable from it is read-only.
-func (w *PeerWatcher) Config() *PeersConfig {
+func (w *peerWatcher) Config() *PeersConfig {
 	return w.cur.Load()
 }
 
 // reload re-reads and re-validates the peers file, then swaps it in. The
-// entire file is parsed, validated and turned into a new Policy before
+// entire file is parsed, validated and turned into a new policy before
 // anything is swapped, so a malformed or invalid file leaves the previous
 // config in force: a typo neither revokes everyone nor widens access.
 //
@@ -776,13 +781,13 @@ func (w *PeerWatcher) Config() *PeersConfig {
 // that drops the result drops that removal permanently, and no later
 // reload will ever list the peer again. Unexported so that a caller
 // outside this package cannot make that mistake.
-func (w *PeerWatcher) reload() ReloadResult {
+func (w *peerWatcher) reload() reloadResult {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.reloadLocked()
 }
 
-func (w *PeerWatcher) reloadLocked() ReloadResult {
+func (w *peerWatcher) reloadLocked() reloadResult {
 	// Record what was read before reading it: on failure this stops the
 	// periodic re-arm from retrying the same broken file every tick.
 	id := statFileID(w.path)
@@ -790,21 +795,21 @@ func (w *PeerWatcher) reloadLocked() ReloadResult {
 	cfg, err := LoadPeersConfig(w.path)
 	if err != nil {
 		w.seen = id
-		return ReloadResult{Path: w.path, Err: err, PeerCount: len(w.cur.Load().Peers)}
+		return reloadResult{Path: w.path, Err: err, PeerCount: len(w.cur.Load().peers)}
 	}
 
 	prev := w.cur.Load()
-	diff := diffPeers(prev.Peers, cfg.Peers)
+	diff := diffPeers(prev.peers, cfg.peers)
 	// The new config is complete here: parsed, validated, and with its
-	// Policy built. Only now is it published, in one atomic store.
+	// policy built. Only now is it published, in one atomic store.
 	w.cur.Store(cfg)
 	w.seen = id
 
-	return ReloadResult{Path: w.path, PeerCount: len(cfg.Peers), Diff: diff}
+	return reloadResult{Path: w.path, PeerCount: len(cfg.peers), Diff: diff}
 }
 
 // report hands a reload result to the callback, or logs it if there is none.
-func (w *PeerWatcher) report(r ReloadResult) {
+func (w *peerWatcher) report(r reloadResult) {
 	if w.onReload != nil {
 		w.onReload(r)
 		return
@@ -829,7 +834,7 @@ func (w *PeerWatcher) report(r ReloadResult) {
 // file when it changes. It returns nil on cancellation and an error if the
 // watch itself fails, which the caller must treat as fatal: a dead watch
 // means revocation has stopped working.
-func (w *PeerWatcher) Run(ctx context.Context) error {
+func (w *peerWatcher) Run(ctx context.Context) error {
 	debounce := time.NewTimer(reloadDebounce)
 	stopTimer(debounce)
 	defer stopTimer(debounce)
@@ -875,7 +880,7 @@ func (w *PeerWatcher) Run(ctx context.Context) error {
 			w.rearmWatch()
 			w.mu.Lock()
 			changed := statFileID(w.path) != w.seen
-			var r ReloadResult
+			var r reloadResult
 			if changed {
 				r = w.reloadLocked()
 			}
@@ -889,7 +894,7 @@ func (w *PeerWatcher) Run(ctx context.Context) error {
 
 // rearmWatch re-adds the directory watch. fsnotify treats a repeated Add as
 // a refresh, so this is safe to call on every suspicious event.
-func (w *PeerWatcher) rearmWatch() {
+func (w *peerWatcher) rearmWatch() {
 	if err := w.fsw.Add(w.dir); err != nil {
 		slog.Error("gocloak: could not re-arm peers file watch, revocation may have stopped",
 			"dir", w.dir, "error", err)
@@ -897,7 +902,7 @@ func (w *PeerWatcher) rearmWatch() {
 }
 
 // Close releases the filesystem watch. It is idempotent.
-func (w *PeerWatcher) Close() error {
+func (w *peerWatcher) Close() error {
 	var err error
 	w.closeOnce.Do(func() { err = w.fsw.Close() })
 	return err

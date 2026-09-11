@@ -25,7 +25,7 @@ import (
 // deviceTestKeypair generates a Curve25519 keypair in the base64 form
 // operators paste and config.go validates. It deliberately does not shell
 // out to the CLI: the library must be testable on its own.
-func deviceTestKeypair(t *testing.T) (privKey Secret, pubB64 string) {
+func deviceTestKeypair(t *testing.T) (privKey secret, pubB64 string) {
 	t.Helper()
 	var priv [32]byte
 	if _, err := rand.Read(priv[:]); err != nil {
@@ -45,7 +45,7 @@ func deviceTestKeypair(t *testing.T) (privKey Secret, pubB64 string) {
 }
 
 // deviceTestPSK generates a random 32-byte preshared key, base64 encoded.
-func deviceTestPSK(t *testing.T) Secret {
+func deviceTestPSK(t *testing.T) secret {
 	t.Helper()
 	var psk [32]byte
 	if _, err := rand.Read(psk[:]); err != nil {
@@ -54,13 +54,13 @@ func deviceTestPSK(t *testing.T) Secret {
 	return deviceTestSecret(base64.StdEncoding.EncodeToString(psk[:]))
 }
 
-// deviceTestSecret wraps a base64 key the way SecretResolver.Resolve would.
-func deviceTestSecret(b64 string) Secret {
-	return Secret{value: []byte(b64)}
+// deviceTestSecret wraps a base64 key the way secretResolver.Resolve would.
+func deviceTestSecret(b64 string) secret {
+	return secret{value: []byte(b64)}
 }
 
-// deviceTestB64 returns a Secret's base64 text, for assertions only.
-func deviceTestB64(s Secret) string {
+// deviceTestB64 returns a secret's base64 text, for assertions only.
+func deviceTestB64(s secret) string {
 	return string(s.bytes())
 }
 
@@ -86,7 +86,7 @@ var (
 // deviceTestPair brings up a server device and a client device over
 // localhost UDP. clientPSK is configured on the client only, so a caller
 // can hand it a wrong PSK and watch the handshake fail.
-func deviceTestPair(t *testing.T, serverPSK, clientPSK Secret) (server, client *tunnelDevice) {
+func deviceTestPair(t *testing.T, serverPSK, clientPSK secret) (server, client *tunnelDevice) {
 	t.Helper()
 
 	serverPriv, serverPub := deviceTestKeypair(t)
@@ -777,7 +777,7 @@ func TestDeviceLogLevelsMatchWireguard(t *testing.T) {
 }
 
 // TestDeviceOptionsFormatRedactsKeys checks constraint 4 at the type level:
-// key-bearing fields are Secret, so even a careless %+v on the options or on
+// key-bearing fields are secret, so even a careless %+v on the options or on
 // a peer prints a placeholder rather than the key.
 func TestDeviceOptionsFormatRedactsKeys(t *testing.T) {
 	priv, pub := deviceTestKeypair(t)

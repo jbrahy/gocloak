@@ -208,7 +208,7 @@ func (r *securityRelay) reset() {
 // PSK and endpoint. serverHarness.client always uses the peer's real key
 // material and the real server port, so it cannot express "wrong key",
 // "wrong PSK", or "point at the relay". This does not replace it.
-func securityClientDevice(t *testing.T, serverPub string, ip netip.Addr, priv, psk Secret, endpoint netip.AddrPort) *tunnelDevice {
+func securityClientDevice(t *testing.T, serverPub string, ip netip.Addr, priv, psk secret, endpoint netip.AddrPort) *tunnelDevice {
 	t.Helper()
 
 	d, err := newTunnelDevice(deviceOptions{
@@ -280,7 +280,7 @@ func securityProbe(t *testing.T, dst netip.AddrPort, payload []byte, wait time.D
 // device's endpoint is a UDP socket that forwards nothing, so the captured
 // initiation has provably never reached the server: it is unconsumed, which
 // is what makes it usable as its own positive control in test 5.
-func securityCaptureInitiation(t *testing.T, serverPub string, ip netip.Addr, priv, psk Secret) []byte {
+func securityCaptureInitiation(t *testing.T, serverPub string, ip netip.Addr, priv, psk secret) []byte {
 	t.Helper()
 
 	sink, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -417,7 +417,7 @@ func TestSecurityWrongClientKeyGetsZeroBytesBack(t *testing.T) {
 	relay.reset()
 	good := securityClientDevice(t, h.serverPub, peer.IP, peer.Priv, peer.PSK, relay.addr)
 	conn, status := serverTestHello(t, good, "db")
-	if status != StatusOK {
+	if status != statusOK {
 		t.Fatalf("positive control: status = %v, want ok", status)
 	}
 	conn.Close()
@@ -533,7 +533,7 @@ func TestSecurityWrongPSKNeverCompletesAHandshake(t *testing.T) {
 	relay.reset()
 	good := securityClientDevice(t, h.serverPub, peer.IP, peer.Priv, peer.PSK, relay.addr)
 	conn, status := serverTestHello(t, good, "db")
-	if status != StatusOK {
+	if status != statusOK {
 		t.Fatalf("positive control: status = %v, want ok", status)
 	}
 	if _, err := conn.Write([]byte("ping")); err != nil {
@@ -586,7 +586,7 @@ func TestSecurityRevokedPeerCanNoLongerConnect(t *testing.T) {
 	exchange := func(d *tunnelDevice, who string) {
 		t.Helper()
 		conn, status := serverTestHello(t, d, "db")
-		if status != StatusOK {
+		if status != statusOK {
 			t.Fatalf("%s: status = %v, want ok", who, status)
 		}
 		defer conn.Close()
@@ -647,7 +647,7 @@ func TestSecurityRevokedPeerCanNoLongerConnect(t *testing.T) {
 // Both peers grant a service called "db", pointing at DIFFERENT backends, so
 // a pass proves the server resolves the name inside the requesting peer's own
 // grant map rather than in a global one. Then each peer asks for a name only
-// the other holds and must be refused with StatusDenied (0x01).
+// the other holds and must be refused with statusDenied (0x01).
 // ---------------------------------------------------------------------------
 
 func TestSecurityPeerCannotReachAnotherPeersService(t *testing.T) {
@@ -669,7 +669,7 @@ func TestSecurityPeerCannotReachAnotherPeersService(t *testing.T) {
 	greeting := func(d *tunnelDevice, service, who string) string {
 		t.Helper()
 		conn, status := serverTestHello(t, d, service)
-		if status != StatusOK {
+		if status != statusOK {
 			t.Fatalf("%s asking for %q: status = %v, want ok", who, service, status)
 		}
 		defer conn.Close()
@@ -696,14 +696,14 @@ func TestSecurityPeerCannotReachAnotherPeersService(t *testing.T) {
 	beforeA := backendA.conns.Load()
 	beforeB := backendB.conns.Load()
 
-	if conn, status := serverTestHello(t, clientA, "only-b"); status != StatusDenied {
+	if conn, status := serverTestHello(t, clientA, "only-b"); status != statusDenied {
 		conn.Close()
 		t.Fatalf("peer A asking for peer B's service: status = %v (0x%02x), want denied (0x01)",
 			status, byte(status))
 	} else {
 		conn.Close()
 	}
-	if conn, status := serverTestHello(t, clientB, "only-a"); status != StatusDenied {
+	if conn, status := serverTestHello(t, clientB, "only-a"); status != statusDenied {
 		conn.Close()
 		t.Fatalf("peer B asking for peer A's service: status = %v (0x%02x), want denied (0x01)",
 			status, byte(status))
@@ -810,7 +810,7 @@ func TestSecurityReplayedHandshakeInitiationIsRejected(t *testing.T) {
 	// left the server wedged.
 	client := h.client(peer)
 	conn, status := serverTestHello(t, client, "db")
-	if status != StatusOK {
+	if status != statusOK {
 		t.Fatalf("after the replays, the real client got status %v, want ok", status)
 	}
 	conn.Close()
