@@ -14,8 +14,12 @@ and the invariants checklist at the end. That checklist is the review criteria.
 **Do not open a public issue for a vulnerability.** Do not send a pull request
 that fixes one either, because the diff is the disclosure.
 
-Email the maintainer at `<SECURITY_CONTACT_EMAIL>` (maintainer: fill this in)
-with:
+Use GitHub's private vulnerability reporting, which is enabled on this
+repository: go to the Security tab and choose "Report a vulnerability". That
+opens a private advisory visible only to you and the maintainer, so nothing is
+disclosed while the issue is being fixed.
+
+Include:
 
 - what the issue is, and which file and function it lives in;
 - how to reproduce it, ideally as a failing test;
