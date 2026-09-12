@@ -3,3 +3,4 @@ credentials.md
 *.psk
 *.cnf
 .superpowers/
+/bin/

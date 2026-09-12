@@ -145,7 +145,7 @@ peers:
       max_concurrent: 32
       dials_per_second: 10
     allow:
-      primary-db: 192.0.2.10:3306
+      primary-db: 127.0.0.1:19000
       cache: 192.0.2.11:6379
 ```
 
@@ -156,6 +156,11 @@ Everything under `allow` is an explicit grant of one service name to one
 literal `ip:port`. A hostname is rejected at load time, because nothing in this
 project resolves names. There is no wildcard, no CIDR and no port range.
 Absence is denial, and a peer with no `allow` map can reach nothing.
+
+The `primary-db` grant above points at `127.0.0.1:19000`, which is
+`gocloak-sink`'s default `--listen` address: the two example apps in step 6
+below use this exact `peers.yaml`. In a real deployment `primary-db` would
+instead point at the actual database, for example `192.0.2.10:3306`.
 
 ### 5. Run the server
 
@@ -168,7 +173,88 @@ port to the internet, the UDP `listen_port`. It fails closed: an unreachable
 secret store, a malformed config or an unreadable key at startup exits non-zero
 rather than starting degraded, so systemd backs off and retries.
 
-### 6. Dial from an application
+### 6. Try it with the example apps
+
+`cmd/gocloak-sink` and `cmd/gocloak-send` are two small binaries built from
+this repository, useful for testing a deployment before wiring up a real
+application. Build them, and the CLI, with `make build`, which puts all
+three under `bin/`.
+
+`gocloak-sink` is a plain TCP service. It is deliberately **not** a goCloak
+peer: it speaks no tunnel protocol, and it is the same kind of ordinary
+backend the database is in the diagram above. Start it listening on the
+address `peers.yaml` already grants `primary-db` to:
+
+```
+bin/gocloak-sink --listen 127.0.0.1:19000
+```
+
+```
+gocloak-sink: listening on 127.0.0.1:19000 (plain TCP, not a goCloak peer)
+```
+
+In another terminal, start the server from step 5 if it is not already
+running, then send a message with `gocloak-send`, a real goCloak client.
+Every flag takes a reference or a literal value the server also holds; none
+of them are optional:
+
+```
+bin/gocloak-send \
+  --endpoint 127.0.0.1:51820 \
+  --server-key E8vwqazY4tBKwTCemvAXSNPYiemQev7HD9Ahyt+/s30= \
+  --key file:/etc/gocloak/app-01.key \
+  --psk file:/etc/gocloak/app-01.psk \
+  --tunnel-ip 10.99.0.7 \
+  --service primary-db \
+  "hello from the tunnel"
+```
+
+```
+sent 21 bytes, ack in 0ms
+```
+
+`--server-key` is the `public_key` `gocloak keygen --name server` printed;
+`--endpoint` and `--tunnel-ip` match `server.yaml`'s `listen_port` and this
+peer's `tunnel_ip` in `peers.yaml`. `--timeout` is optional and defaults to
+`gocloak.DefaultDialTimeout` (10s). The positional argument is the message.
+`gocloak-sink`'s terminal shows the message arriving, with a timestamp and
+the source address inside the tunnel:
+
+```
+2026-09-11T23:02:52-07:00 127.0.0.1:51700: hello from the tunnel
+```
+
+Dialing a service this peer's `allow` map does not grant fails the same way
+a real application's mistake would, with a distinct exit code (`10`) so a
+script can tell it apart from the other failure classes documented in
+`gocloak-send --help`:
+
+```
+bin/gocloak-send \
+  --endpoint 127.0.0.1:51820 \
+  --server-key E8vwqazY4tBKwTCemvAXSNPYiemQev7HD9Ahyt+/s30= \
+  --key file:/etc/gocloak/app-01.key \
+  --psk file:/etc/gocloak/app-01.psk \
+  --tunnel-ip 10.99.0.7 \
+  --service not-granted \
+  "this should be denied"
+```
+
+```
+gocloak-send: denied: this peer's allow map does not grant this service
+```
+
+`gocloak-send` never prints `--key` or `--psk`, in any output including
+these error paths: they are references to secrets, not values, and the
+point of the example is that a client only ever holds a reference.
+
+You will see a line like this in the server's log, roughly every 6 seconds,
+for any peer that has not yet completed a handshake: `Failed to send
+handshake initiation: no known endpoint for peer`. That is a known,
+separately tracked issue with idle-peer logging, not a sign anything above
+is broken.
+
+### 7. Dial from your own application
 
 ```go
 package main
@@ -222,7 +308,10 @@ driver that accepts a dialer. It ignores `network` and treats `addr` as the
 service name with any `:port` suffix stripped.
 
 `example_test.go` in this repository runs the whole of the above end to end,
-server and client and backend, in one process.
+server and client and backend, in one process. `examples_test.go` runs the
+same shape with `internal/msg`'s sink in place of the backend: it is the
+in-process version of step 6, and it fails if the example apps ever drift
+from what this quickstart shows.
 
 ## Security properties that hold
 
@@ -381,6 +470,7 @@ make test    # go test -race ./...
 make lint    # go vet and staticcheck
 make fuzz    # fuzz the hello frame parser
 make vuln    # govulncheck
+make build   # build gocloak, gocloak-sink and gocloak-send into bin/
 ```
 
 `go test -run Example ./...` runs a real tunnel, a real server and a real

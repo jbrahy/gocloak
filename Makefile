@@ -1,4 +1,4 @@
-.PHONY: test lint fuzz vuln
+.PHONY: test lint fuzz vuln build
 
 test:
 	go test -race ./...
@@ -12,3 +12,8 @@ fuzz:
 
 vuln:
 	govulncheck ./...
+
+build:
+	go build -o bin/gocloak ./cmd/gocloak
+	go build -o bin/gocloak-sink ./cmd/gocloak-sink
+	go build -o bin/gocloak-send ./cmd/gocloak-send
