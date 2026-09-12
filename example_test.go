@@ -155,8 +155,11 @@ func exampleStartServer(ctx context.Context, backendAddr string) *exampleDeploym
 	psk := exampleRandomKey()
 
 	// gocloak never accepts a literal key, only a reference to one. In
-	// production these are aws:sm: references; file: is the offline form
-	// and refuses to read anything looser than 0600.
+	// production these are usually aws:sm: references, resolved by the
+	// separate github.com/jbrahy/gocloak/awssecrets module wired in as
+	// ClientConfig.Resolver and ServerConfig.Resolver; file: is the
+	// offline form this package resolves itself, and it refuses to read
+	// anything looser than 0600.
 	serverKeyRef := exampleWriteSecret(filepath.Join(dir, "server.key"), serverPriv)
 	peerKeyRef := exampleWriteSecret(filepath.Join(dir, "app-01.key"), peerPriv)
 	pskRef := exampleWriteSecret(filepath.Join(dir, "app-01.psk"), psk)

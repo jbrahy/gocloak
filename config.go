@@ -579,8 +579,14 @@ func validPublicKey(s string) error {
 
 // validSecretRef checks a secret reference's syntax without resolving it.
 // Decoding config must never contact a secret store: references are
-// resolved at server startup, so a config test needs no AWS and a reload
-// cannot block on the network.
+// resolved at server startup, so a config test needs no credentials and a
+// reload cannot block on the network.
+//
+// It checks shape, not scheme. Which schemes resolve depends on the
+// SecretResolver the program wires into its config, and a config file is
+// decoded long before that resolver is in sight, so a reference naming a
+// scheme this package does not implement decodes here and fails at
+// resolution with an error that says a Resolver is needed.
 func validSecretRef(ref SecretRef) error {
 	if ref == "" {
 		return errors.New("is required")
@@ -589,7 +595,7 @@ func validSecretRef(ref SecretRef) error {
 	// literal key where a reference belongs must not have that value
 	// copied into an error message and from there into a log line.
 	if _, _, err := parseSecretRef(ref); err != nil {
-		return errors.New("must be one of aws:sm:<id>, aws:ssm:<name>, file:<path>, env:<VAR>")
+		return errors.New("must be a reference of the form <scheme>:<value>, for example file:<path> or env:<VAR>")
 	}
 	return nil
 }

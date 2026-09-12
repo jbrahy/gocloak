@@ -1042,3 +1042,72 @@ func TestClientConcurrentDialsAreSafe(t *testing.T) {
 		t.Errorf("concurrent Dial failed: %v", err)
 	}
 }
+
+// TestClientResolverIsConsultedForNonNativeSchemes is the client half of
+// the plumbing added when the AWS schemes moved into their own module: a
+// ClientConfig.Resolver is what makes a scheme other than file: or env:
+// resolvable, and the whole client comes up on key material that came
+// through it.
+func TestClientResolverIsConsultedForNonNativeSchemes(t *testing.T) {
+	priv, _ := deviceTestKeypair(t)
+	_, pub := deviceTestKeypair(t)
+	psk := deviceTestPSK(t)
+
+	asked := map[SecretRef]int{}
+	resolver := resolverFunc(func(ctx context.Context, ref SecretRef) ([]byte, error) {
+		asked[ref]++
+		switch ref {
+		case "vault:gocloak/app/private":
+			return []byte(deviceTestB64(priv)), nil
+		case "vault:gocloak/app/psk":
+			return []byte(deviceTestB64(psk)), nil
+		}
+		return nil, fmt.Errorf("no value for %q", string(ref))
+	})
+
+	c, err := NewClient(ClientConfig{
+		// TEST-NET-2 (RFC 5737): nothing answers, and NewClient
+		// sends no packet anyway.
+		Endpoint:     "198.51.100.1:51820",
+		ServerPubKey: pub,
+		PrivateKey:   "vault:gocloak/app/private",
+		PresharedKey: "vault:gocloak/app/psk",
+		TunnelIP:     netip.MustParseAddr("10.99.0.8"),
+		Resolver:     resolver,
+	})
+	if err != nil {
+		t.Fatalf("NewClient with a Resolver: %v", err)
+	}
+	defer c.Close()
+
+	if asked["vault:gocloak/app/private"] != 1 || asked["vault:gocloak/app/psk"] != 1 {
+		t.Fatalf("resolver calls = %v, want each reference resolved exactly once", asked)
+	}
+}
+
+// TestClientNonNativeSchemeWithNoResolverFailsClosed is the other half: the
+// same config without a Resolver must refuse to build a client rather than
+// come up with something improvised in place of a key.
+func TestClientNonNativeSchemeWithNoResolverFailsClosed(t *testing.T) {
+	_, pub := deviceTestKeypair(t)
+
+	_, err := NewClient(ClientConfig{
+		Endpoint:     "198.51.100.1:51820",
+		ServerPubKey: pub,
+		PrivateKey:   "aws:sm:gocloak/app/private",
+		PresharedKey: "aws:sm:gocloak/app/psk",
+		TunnelIP:     netip.MustParseAddr("10.99.0.8"),
+	})
+	if err == nil {
+		t.Fatal("NewClient succeeded with an aws:sm: reference and no Resolver")
+	}
+	if !strings.Contains(err.Error(), "private key") {
+		t.Errorf("error should name the private key, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Resolver") {
+		t.Errorf("error should say a Resolver is needed, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "gocloak/app/private") {
+		t.Errorf("error echoes the reference payload: %v", err)
+	}
+}

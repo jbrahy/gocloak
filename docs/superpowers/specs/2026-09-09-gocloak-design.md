@@ -202,16 +202,51 @@ and no port range. Absence is denial.
 
 ### 6.1 Secret references
 
+The core module resolves exactly two schemes, and needs nothing outside the
+standard library to do it:
+
 ```
-aws:sm:<secret-id>     AWS Secrets Manager
-aws:ssm:<parameter>    AWS SSM Parameter Store, WithDecryption
 file:<path>            file contents, must be mode 0600 or stricter
 env:<VAR>              environment variable
 ```
 
-`aws:sm` is the production form. Resolved values live in memory only and are
-never written to disk. `file:` refuses to read a file with permissions looser
-than 0600.
+Every other scheme comes from a `SecretResolver` the program supplies, set on
+`ClientConfig.Resolver` or `ServerConfig.Resolver`. The AWS schemes are one
+such resolver, in a nested module of their own:
+
+```
+aws:sm:<secret-id>     AWS Secrets Manager                 github.com/jbrahy/gocloak/awssecrets
+aws:ssm:<parameter>    AWS SSM Parameter Store, WithDecryption
+```
+
+`aws:sm` is still the production form for an AWS deployment. Resolved values
+live in memory only and are never written to disk. `file:` refuses to read a
+file with permissions looser than 0600. An unknown scheme is always an error;
+it is never a fallback to treating the reference as a literal key, and a
+`Resolver` is never consulted for `file:` or `env:`, so one cannot take those
+two over.
+
+Why the split, since it is a breaking change. Resolution used to switch on the
+scheme at runtime inside this package, which made every scheme's
+implementation reachable from any use of the package, so all of them linked. A
+program whose entire body was `gocloak.ValidServiceName("x")` pulled 89 AWS
+packages into its build and produced a 4.9 MB stripped binary. Someone keeping
+key material in a `file:` or `env:` reference paid for Secrets Manager and SSM
+in binary size, dependency count and supply-chain exposure, and never learned
+why. For a library whose reason to exist is a small auditable attack surface,
+that is worse as a supply-chain problem than as a size problem.
+
+A subpackage would not have fixed it: `go.mod` and `go.sum` would still carry
+`aws-sdk-go-v2`, `go mod download` would still fetch it, and an audit of this
+module would still have to cover it. A nested module with its own `go.mod`
+takes AWS out of the core dependency graph entirely. The same program now
+links 0 AWS packages, 205 packages in total rather than 358, and is 3.4 MB
+stripped.
+
+Wiring is explicit rather than a `database/sql`-style global `Register`. Global
+mutable state in a security library means any imported package can silently
+install a secret resolver; whoever builds the config should be the one who
+decides where key material comes from.
 
 ## 7. Threat model
 
@@ -326,7 +361,8 @@ gocloak/
   config.go        YAML types, validation, atomic hot reload
   policy.go        the policy engine
   wire.go          hello frame codec
-  secret.go        SecretRef resolution
+  secret.go        SecretRef resolution, file: and env:, SecretResolver
+  awssecrets/      nested module: aws:sm and aws:ssm, its own go.mod
   cmd/gocloak/     keygen, serve
   docs/
 ```
@@ -339,7 +375,7 @@ Every `.go` file above has a matching `_test.go`.
 |---|---|---|
 | `golang.zx2c4.com/wireguard` | `v0.0.0-20260522210424-ecfc5a8d5446` | Noise IKpsk2 and the netstack TUN. Verified to accept `preshared_key`, to ship `cookie.go`, and to support `update_only` and `remove` for live revocation. |
 | `gvisor.dev/gvisor` | `v0.0.0-20250503011706-39ed1f5ac29c` | Userspace TCP, pulled transitively by the above. |
-| `github.com/aws/aws-sdk-go-v2` | latest at implementation | Secrets Manager and SSM. |
+| `github.com/aws/aws-sdk-go-v2` | latest at implementation | Secrets Manager and SSM. **Not a dependency of this module.** It lives in the nested `awssecrets` module and is pulled in only by programs that resolve `aws:` references. See 6.1. |
 | `gopkg.in/yaml.v3` | latest at implementation | Config, used with `KnownFields(true)`. |
 | `github.com/fsnotify/fsnotify` | latest at implementation | Peers file watching. |
 

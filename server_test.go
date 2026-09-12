@@ -1993,3 +1993,63 @@ func TestServerDrainClosesLiveConnectionsBeforeWaiting(t *testing.T) {
 		t.Fatal("the backend side of the tracked connection was left open")
 	}
 }
+
+// TestServerResolverComesFromTheConfig is the server half of the plumbing
+// added when the AWS schemes moved into their own module. Run builds its
+// resolver from ServerConfig.Resolver, so a scheme this package does not
+// implement resolves exactly when the program configured something that
+// resolves it, and fails closed when it did not.
+func TestServerResolverComesFromTheConfig(t *testing.T) {
+	peer := serverTestNewPeer(t, "app-01", "10.99.0.7")
+	peersPath := filepath.Join(t.TempDir(), "peers.yaml")
+	serverTestWritePeers(t, peersPath, []*serverTestPeer{peer})
+
+	errStoreDown := errors.New("secret store unavailable")
+
+	run := func(t *testing.T, resolver SecretResolver) error {
+		t.Helper()
+		srv, err := NewServer(ServerConfig{
+			ListenPort: deviceTestFreeUDPPort(t),
+			PrivateKey: "vault:gocloak/server/private",
+			TunnelIP:   deviceTestServerIP,
+			PeersFile:  peersPath,
+			Resolver:   resolver,
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		runErr := make(chan error, 1)
+		go func() { runErr <- srv.Run(ctx) }()
+		select {
+		case err := <-runErr:
+			return err
+		case <-ctx.Done():
+			t.Fatal("Run did not return; it must fail closed rather than serve")
+			return nil
+		}
+	}
+
+	t.Run("resolver is used", func(t *testing.T) {
+		err := run(t, resolverFunc(func(ctx context.Context, ref SecretRef) ([]byte, error) {
+			return nil, errStoreDown
+		}))
+		if !errors.Is(err, errStoreDown) {
+			t.Fatalf("Run error = %v, want the configured Resolver's error", err)
+		}
+		if strings.Contains(err.Error(), "gocloak/server/private") {
+			t.Fatalf("Run error echoes the secret reference: %v", err)
+		}
+	})
+
+	t.Run("no resolver fails closed", func(t *testing.T) {
+		err := run(t, nil)
+		if err == nil {
+			t.Fatal("Run started with a vault: reference and no Resolver")
+		}
+		if !strings.Contains(err.Error(), "private key") || !strings.Contains(err.Error(), "Resolver") {
+			t.Fatalf("Run error = %v, want it to name the private key and say a Resolver is needed", err)
+		}
+	})
+}

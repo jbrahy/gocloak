@@ -158,7 +158,9 @@ An unrecognized key is a hard error. A typo in a security-relevant key has to
 fail loudly rather than quietly granting or revoking access.
 
 For production use `private_key: aws:sm:gocloak/server/private` instead of a
-`file:` reference. See [7.2](#72-secret-references) for every scheme.
+`file:` reference. That scheme lives in the separate
+`github.com/jbrahy/gocloak/awssecrets` module and needs wiring in; see
+[7.2](#72-secret-references) for every scheme and for the wiring.
 
 ### 4.2 `peers.yaml`
 
@@ -299,9 +301,18 @@ import (
 	"time"
 
 	"github.com/jbrahy/gocloak"
+	"github.com/jbrahy/gocloak/awssecrets"
 )
 
 func main() {
+	// Only needed because one of the references below is aws:sm:. A
+	// config that is all file: and env: needs no Resolver and no
+	// awssecrets import, and links no AWS SDK.
+	resolver, err := awssecrets.New(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
 	client, err := gocloak.NewClient(gocloak.ClientConfig{
 		Endpoint:     "tunnel.example.com:51820",
 		ServerPubKey: "lv7sINDEP2auW5+l46h3aWpttdKaUQSDLudoIoTp6xg=",
@@ -310,6 +321,7 @@ func main() {
 		TunnelIP:     netip.MustParseAddr("10.99.0.7"),
 		MTU:          1280,
 		DialTimeout:  10 * time.Second,
+		Resolver:     resolver,
 	})
 	if err != nil {
 		panic(err)
@@ -490,22 +502,66 @@ list that can no longer change.
 Every secret-bearing field takes a reference, never a value. References are
 resolved at startup into memory and never written to disk.
 
+The library itself resolves two schemes, with no dependency outside the
+standard library:
+
+| Reference | Source |
+|---|---|
+| `file:<path>` | file contents. Refused if the mode is looser than 0600 |
+| `env:<VAR>` | environment variable |
+
+Every other scheme comes from a `SecretResolver` you supply:
+
+```go
+type SecretResolver interface {
+	ResolveSecret(ctx context.Context, ref SecretRef) ([]byte, error)
+}
+```
+
+Set it on `ClientConfig.Resolver` or `ServerConfig.Resolver`. It is optional:
+nil means `file:` and `env:` only. `file:` and `env:` are resolved before a
+`Resolver` is consulted, so a `Resolver` can add schemes but can never take
+those two over.
+
+The AWS schemes are such a resolver, shipped as a separate module:
+
 | Reference | Source |
 |---|---|
 | `aws:sm:<secret-id>` | AWS Secrets Manager. The production form |
 | `aws:ssm:<parameter>` | AWS SSM Parameter Store, read `WithDecryption` |
-| `file:<path>` | file contents. Refused if the mode is looser than 0600 |
-| `env:<VAR>` | environment variable |
+
+```
+go get github.com/jbrahy/gocloak/awssecrets
+```
+
+```go
+import (
+	"github.com/jbrahy/gocloak"
+	"github.com/jbrahy/gocloak/awssecrets"
+)
+
+resolver, err := awssecrets.New(ctx)
+if err != nil {
+	return err
+}
+
+srv, err := gocloak.NewServer(gocloak.ServerConfig{
+	// ... listen_port, private_key, tunnel_ip, peers_file as usual
+	Resolver: resolver,
+})
+```
+
+`awssecrets.New` builds its clients from the ambient AWS region and
+credentials. Because it is a separate module, a deployment whose references
+are all `file:` or `env:` never imports it, never downloads the AWS SDK, and
+never needs an AWS configuration to start. That is the change from v0.1.0: the
+`aws:` schemes used to be built in, and an `aws:` reference with no `Resolver`
+is now a startup error naming the module to import.
 
 An unknown scheme is always an error, never a fallback to treating the string
 as a literal key. If the secret store is unreachable at startup the server
 exits non-zero rather than starting on a stale peer list, which would keep
 revoked peers alive.
-
-`aws:sm` and `aws:ssm` use the ambient AWS region and credentials. Note that
-the AWS clients are constructed even when every reference in your config is
-`file:` or `env:`, so the process still needs a resolvable AWS configuration to
-start.
 
 ### 7.3 Rotation needs a restart, revocation does not
 

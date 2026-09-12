@@ -66,6 +66,17 @@ type ServerConfig struct {
 	// PeersFile is the path to peers.yaml. It is watched and hot
 	// reloaded, so a revocation takes effect without a restart.
 	PeersFile string
+
+	// Resolver resolves secret references whose scheme this package does
+	// not implement. Optional: nil means file: and env: only, which is
+	// the whole of what this package resolves on its own.
+	//
+	// It is wired here rather than registered globally on purpose. A
+	// database/sql-style global registry would let any imported package
+	// install a secret resolver without the program that links it saying
+	// so, which is the wrong default for a security library. Whoever
+	// builds the config decides where key material comes from.
+	Resolver SecretResolver
 }
 
 // ServerConfigFrom maps the validated content of server.yaml onto a
@@ -103,8 +114,8 @@ type Server struct {
 	// Constraint 4: peer name, service name, status and byte counts only.
 	logger *slog.Logger
 
-	// resolver resolves secret references. It is created on demand in Run
-	// so a test can substitute one that needs no AWS.
+	// resolver resolves secret references. It is created in Run from
+	// cfg.Resolver so a test can substitute one first.
 	resolver *secretResolver
 
 	// onReloadApplied, if non-nil, is called after a reload has been
@@ -200,11 +211,7 @@ func (s *Server) Run(ctx context.Context) (err error) {
 	s.baseCtx = ctx
 
 	if s.resolver == nil {
-		r, rerr := newSecretResolver(ctx)
-		if rerr != nil {
-			return fmt.Errorf("gocloak: server: secret resolver: %w", rerr)
-		}
-		s.resolver = r
+		s.resolver = &secretResolver{external: s.cfg.Resolver}
 	}
 
 	privateKey, kerr := s.resolveSecret(ctx, s.cfg.PrivateKey)
@@ -972,8 +979,21 @@ func scrubRef(err error, ref SecretRef) error {
 		return nil
 	}
 	msg := strings.ReplaceAll(err.Error(), string(ref), redactedRefPlaceholder)
-	if _, payload, perr := parseSecretRef(ref); perr == nil && payload != "" {
-		msg = strings.ReplaceAll(msg, payload, redactedRefPlaceholder)
+	// A store's own error repeats the tail of the reference without the
+	// scheme in front of it, so every suffix after a colon is scrubbed
+	// too, not just the whole reference: "aws:sm:gocloak/server/private"
+	// would otherwise leave both "sm:gocloak/server/private" and
+	// "gocloak/server/private" in the message.
+	for rest := string(ref); ; {
+		i := strings.IndexByte(rest, ':')
+		if i < 0 {
+			break
+		}
+		rest = rest[i+1:]
+		if rest == "" {
+			break
+		}
+		msg = strings.ReplaceAll(msg, rest, redactedRefPlaceholder)
 	}
 	return &redactedError{msg: msg, err: err}
 }

@@ -54,6 +54,10 @@ go test -count=1 -race ./...
 govulncheck ./...
 ```
 
+`awssecrets/` is a **separate Go module**, so `./...` from the repository root
+does not include it. `make test`, `make lint` and `make vuln` cover both; run
+the same set again inside `awssecrets/` if you are working there.
+
 `go test -race ./...` takes about 200 seconds. It is not hung. Most of that is
 real WireGuard handshakes and real gVisor netstack TCP running in-process,
 which is the point: the integration and threat-model tests are real tunnels,
@@ -100,6 +104,15 @@ small enough to audit. New unexported helpers are fine.
 **No new dependencies without a strong argument.** The dependency list is part
 of the attack surface, and every direct dependency in `go.mod` today earns its
 place.
+
+**A secret store's SDK is never a core dependency.** The core module resolves
+`file:` and `env:` with the standard library, and every other scheme comes
+from a caller-supplied `gocloak.SecretResolver`. Support for a new store is a
+nested module alongside `awssecrets/`, with its own `go.mod`, never a package
+inside the core module: a subpackage would put the SDK back in the core
+`go.mod` and `go.sum`, where every consumer downloads it and every audit has
+to cover it. See section 6.1 of the design spec for the measurements that
+motivated this.
 
 **The fail-closed tie-breaker.** When two implementations are defensible,
 choose the one that denies. When you cannot tell which way is safer, say so in

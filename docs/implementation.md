@@ -138,8 +138,16 @@ It produces validated data and a diff; applying them is the server's job.
 
 ### `secret.go`
 
-Owns `SecretRef` parsing and resolution to an in-memory `secret`. Four schemes,
-no fallback to treating an unparsed string as a literal key. `secret.String`
+Owns `SecretRef` parsing and resolution to an in-memory `secret`. Two schemes
+natively, `file:` and `env:`, neither needing a dependency outside the standard
+library. Every other scheme is delegated to the caller's `SecretResolver`
+(`ClientConfig.Resolver`, `ServerConfig.Resolver`), and is an error when there
+is none; `aws:sm:` and `aws:ssm:` are that resolver, in the nested
+`awssecrets` module. `file:` and `env:` are resolved before a `Resolver` is
+consulted, so a `Resolver` can add schemes and can never take those two over. A
+value that arrives from a `Resolver` is wrapped in `secret` on receipt, so it
+inherits the same redaction guarantee as one resolved here. There is no
+fallback to treating an unparsed string as a literal key. `secret.String`
 and `secret.GoString` both return `[REDACTED]`, so a stray `%v`, `%s` or `%#v`
 in a future log line cannot leak key material, and `secret.bytes()` is
 deliberately unexported so the set of code that can hold a plaintext key is the
@@ -442,7 +450,12 @@ tree at the time of writing. The ones to read first when you change something:
   previous config in force, the debounce, rename replacement, and the YAML
   error sanitization that keeps a document key out of a message.
 - `secret_test.go`: unknown scheme rejected, `file:` with permissions looser
-  than 0600 rejected.
+  than 0600 rejected, an `aws:` reference with no `Resolver` rejected with an
+  error that names what to import, a supplied `Resolver` delegated to, and
+  `file:`/`env:` never reaching a `Resolver`.
+- `awssecrets/` (nested module, run its tests from that directory):
+  `aws:sm:` and `aws:ssm:` against fake AWS clients, `WithDecryption` asserted,
+  and an end-to-end test that wires the resolver into a `gocloak.ClientConfig`.
 
 ### Fuzz
 

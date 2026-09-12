@@ -135,7 +135,8 @@ peers_file: /etc/gocloak/peers.yaml
 		{"listen_port out of range", replace("51820", "70000")},
 		{"missing private_key", replace("private_key: aws:sm:gocloak/server/private\n", "")},
 		{"private_key not a secret ref", replace("aws:sm:gocloak/server/private", "hunter2")},
-		{"private_key unknown scheme", replace("aws:sm:gocloak/server/private", "vault:secret/x")},
+		{"private_key scheme with no payload", replace("aws:sm:gocloak/server/private", "vault:")},
+		{"private_key scheme is not scheme shaped", replace("aws:sm:gocloak/server/private", "VAULT:secret/x")},
 		{"missing tunnel_ip", replace("tunnel_ip: 10.99.0.1\n", "")},
 		{"tunnel_ip unparseable", replace("10.99.0.1", "not-an-ip")},
 		{"tunnel_ip unspecified", replace("10.99.0.1", "0.0.0.0")},
@@ -317,7 +318,8 @@ func TestConfigPeersRejects(t *testing.T) {
 		{"public_key not base64", "peers:\n" + entry("app-01", "not!base64!", "10.99.0.7")},
 		{"public_key wrong length", "peers:\n" + entry("app-01", base64.StdEncoding.EncodeToString(make([]byte, 31)), "10.99.0.7")},
 		{"missing psk", strings.Replace("peers:\n"+entry("app-01", testKey(1), "10.99.0.7"), "    psk: env:PSK\n", "", 1)},
-		{"psk unknown scheme", strings.Replace("peers:\n"+entry("app-01", testKey(1), "10.99.0.7"), "env:PSK", "vault:psk", 1)},
+		{"psk scheme with no payload", strings.Replace("peers:\n"+entry("app-01", testKey(1), "10.99.0.7"), "env:PSK", "vault:", 1)},
+		{"psk scheme is not scheme shaped", strings.Replace("peers:\n"+entry("app-01", testKey(1), "10.99.0.7"), "env:PSK", "VAULT:psk", 1)},
 		{"tunnel_ip unparseable", "peers:\n" + entry("app-01", testKey(1), "not-an-ip")},
 		{"tunnel_ip unspecified", "peers:\n" + entry("app-01", testKey(1), "0.0.0.0")},
 		{"tunnel_ip outside tunnel subnet", "peers:\n" + entry("app-01", testKey(1), "10.98.0.7")},
@@ -986,5 +988,34 @@ func TestConfigSanitizeYAMLUnknownFieldGuard(t *testing.T) {
 				t.Errorf("sanitizeYAMLMessage(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestConfigSecretRefUnknownSchemeDecodesAndFailsAtResolution is where the
+// coverage for "vault:secret/x is rejected" went when the AWS schemes moved
+// into their own module.
+//
+// Decoding cannot know which schemes resolve: that depends on the
+// SecretResolver the program wires into its config, and a config file is
+// read long before that resolver exists. So a reference naming a scheme
+// this package does not implement is accepted here on shape and refused at
+// resolution, which is the only place that can tell. What must not happen,
+// at either layer, is the reference being used as a literal key.
+func TestConfigSecretRefUnknownSchemeDecodesAndFailsAtResolution(t *testing.T) {
+	yaml := strings.Replace(validServerYAML, "aws:sm:gocloak/server/private", "vault:secret/gocloak", 1)
+	fc, err := LoadServerConfig(tempFile(t, "server.yaml", yaml))
+	if err != nil {
+		t.Fatalf("a reference with a scheme this package does not implement must still decode: %v", err)
+	}
+	if fc.PrivateKey != SecretRef("vault:secret/gocloak") {
+		t.Fatalf("PrivateKey = %q", string(fc.PrivateKey))
+	}
+
+	got, err := (&secretResolver{}).Resolve(context.Background(), fc.PrivateKey)
+	if err == nil {
+		t.Fatal("resolving vault:secret/gocloak with no Resolver succeeded, want an error")
+	}
+	if string(got.bytes()) != "" {
+		t.Fatal("resolution fell back to treating the reference as a literal value")
 	}
 }

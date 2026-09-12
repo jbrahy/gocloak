@@ -170,7 +170,10 @@ time, because nothing in this project resolves names. An unrecognized key
 anywhere in either file is a hard error, never a silent ignore.
 
 In production, `private_key` and `psk` would be `aws:sm:` references rather
-than `file:` ones.
+than `file:` ones. Those come from the separate
+`github.com/jbrahy/gocloak/awssecrets` module, set as `Resolver` on the
+config; the library itself resolves only `file:` and `env:`. See
+[secret references](docs/integration-guide.md#72-secret-references).
 
 ### 4. Start a backend and the server
 
@@ -251,6 +254,14 @@ Clean up with `rm -rf "$DEMO"`. Those key files are real key material.
 ### 6. Dial from your own application
 
 ```go
+// aws:sm: references need the separate awssecrets module wired in as a
+// Resolver. A config that is all file: and env: needs neither the import
+// nor the Resolver field, and links no AWS SDK.
+resolver, err := awssecrets.New(context.Background())
+if err != nil {
+	panic(err)
+}
+
 client, err := gocloak.NewClient(gocloak.ClientConfig{
 	Endpoint:     "tunnel.example.com:51820",
 	ServerPubKey: "lv7sINDEP2auW5+l46h3aWpttdKaUQSDLudoIoTp6xg=",
@@ -259,6 +270,7 @@ client, err := gocloak.NewClient(gocloak.ClientConfig{
 	TunnelIP:     netip.MustParseAddr("10.99.0.7"),
 	MTU:          1280,
 	DialTimeout:  10 * time.Second,
+	Resolver:     resolver,
 })
 if err != nil {
 	panic(err)
@@ -294,7 +306,7 @@ driver that accepts a dialer. Both are worked through in the
 | Post-quantum hedge | The PSK is mixed into the chaining key. Breaking Curve25519, including harvest-now-decrypt-later, still leaves a 32-byte symmetric secret. |
 | Anti-DoS | Under load the server returns a cookie MAC'd to the source address instead of performing Curve25519. Address validation precedes expensive work. |
 | Blast radius | A stolen client key reaches only that peer's named services. It cannot express an unapproved address, so it cannot scan or pivot. |
-| No key material at rest, with `aws:sm` and `aws:ssm` | Secrets Manager to memory. Nothing in EBS snapshots. CloudTrail records every read. This holds for the `aws:sm` and `aws:ssm` schemes. `gocloak keygen` writes the private key and PSK to disk at 0600, and the `file:` scheme reads key material from disk, so both leave key material at rest by design. |
+| No key material at rest, with `aws:sm` and `aws:ssm` | Secrets Manager to memory. Nothing in EBS snapshots. CloudTrail records every read. This holds for the `aws:sm` and `aws:ssm` schemes, which come from the separate [`awssecrets`](awssecrets/) module. `gocloak keygen` writes the private key and PSK to disk at 0600, and the `file:` scheme reads key material from disk, so both leave key material at rest by design. |
 | Instant revocation | A peers file change removes the peer from the live device. The next packet from that key is dropped. No restart, no window. |
 
 ## What goCloak does not protect against
@@ -349,6 +361,15 @@ unaudited implementation of a good design is still unaudited.
   network that blocks UDP, goCloak does not work.
 - **Logs carry peer name, service name, status and byte counts.** Never key
   material, never payload, at any level including debug.
+- **No cloud SDK in the library.** `file:` and `env:` are resolved with the
+  standard library and nothing else; `aws:sm:` and `aws:ssm:` live in the
+  nested [`awssecrets`](awssecrets/) module, so they are a dependency of the
+  programs that use them and of nothing else. Measured on a program whose
+  entire body is `gocloak.ValidServiceName("x")`: v0.1.0 linked 89 AWS
+  packages, 358 packages in total, and built a 4.9 MB stripped binary. v0.2.0
+  links 0 AWS packages, 205 in total, and builds a 3.4 MB stripped binary. The
+  size is the visible part; the point is 89 packages of attack surface that
+  nobody using a `file:` reference asked for.
 
 ## Authentication failure is indistinguishable from a dead endpoint
 
@@ -401,9 +422,12 @@ full. The four things worth knowing before you start:
   connections are closed. A reload that fails to parse keeps the previous good
   config in force and logs loudly, so a typo neither revokes everyone nor
   widens access.
-- **Secrets are references, never literals**: `aws:sm:`, `aws:ssm:`, `file:`
-  (refused above mode 0600) and `env:`. An unknown scheme is an error, never a
-  fallback to treating the string as a literal key.
+- **Secrets are references, never literals**: `file:` (refused above mode
+  0600) and `env:` are resolved by the library itself. `aws:sm:` and `aws:ssm:`
+  come from the separate [`awssecrets`](awssecrets/) module, set as `Resolver`
+  on the config, so a deployment that does not use them does not link the AWS
+  SDK. An unknown scheme is an error, never a fallback to treating the string
+  as a literal key.
 - **Rotation is not revocation, and rotation needs a restart.** Each reference
   is resolved once and cached for the process lifetime, so changing a secret in
   place under an unchanged reference is never picked up by a reload. Rotate by
@@ -422,6 +446,10 @@ make fuzz    # fuzz the hello frame parser
 make vuln    # govulncheck
 make build   # build gocloak, gocloak-sink and gocloak-send into bin/
 ```
+
+`awssecrets/` is a separate Go module, so `./...` from the repository root
+does not reach it. `make test` and `make lint` run it too; by hand it is
+`cd awssecrets && go test -race ./...`.
 
 `go test -run '^Example$' -v .` runs a real tunnel, a real server and a real
 backend in one process, end to end, in about five seconds.

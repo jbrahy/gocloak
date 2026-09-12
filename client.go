@@ -112,6 +112,17 @@ type ClientConfig struct {
 
 	// DialTimeout bounds one Dial. Zero means DefaultDialTimeout (10s).
 	DialTimeout time.Duration
+
+	// Resolver resolves secret references whose scheme this package does
+	// not implement. Optional: nil means file: and env: only, which is
+	// the whole of what this package resolves on its own.
+	//
+	// It is wired here rather than registered globally on purpose. A
+	// database/sql-style global registry would let any imported package
+	// install a secret resolver without the program that links it saying
+	// so, which is the wrong default for a security library. Whoever
+	// builds the config decides where key material comes from.
+	Resolver SecretResolver
 }
 
 // Client is an application's handle on the tunnel: one WireGuard device,
@@ -209,10 +220,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), clientSecretResolveTimeout)
 	defer cancel()
 
-	resolver, err := clientSecretResolver(ctx, cfg.PrivateKey, cfg.PresharedKey)
-	if err != nil {
-		return nil, fmt.Errorf("gocloak: client: secret resolver: %w", err)
-	}
+	resolver := &secretResolver{external: cfg.Resolver}
 	privateKey, err := resolver.Resolve(ctx, cfg.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("gocloak: client: private key: %w", scrubRef(err, cfg.PrivateKey))
@@ -615,23 +623,4 @@ func clientTunnelIP(addr netip.Addr) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("gocloak: client: tunnel ip %s is not a host address in %s", ip, tunnelSubnet)
 	}
 	return ip, nil
-}
-
-// clientSecretResolver builds a resolver for the references it is given. AWS
-// clients are built only when a reference actually needs one, so a
-// deployment whose secrets are all file: or env: does not fail to start
-// because there is no AWS configuration in the environment.
-func clientSecretResolver(ctx context.Context, refs ...SecretRef) (*secretResolver, error) {
-	for _, ref := range refs {
-		scheme, _, err := parseSecretRef(ref)
-		if err != nil {
-			// Already rejected by validSecretRef; Resolve will
-			// report it again if it ever gets here.
-			continue
-		}
-		if strings.HasPrefix(scheme, "aws:") {
-			return newSecretResolver(ctx)
-		}
-	}
-	return &secretResolver{}, nil
 }

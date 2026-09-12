@@ -8,32 +8,41 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
-	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
 
-// fakeSMClient is a stand-in for the Secrets Manager client. Tests use it so
-// resolution can be exercised without network or AWS credentials.
-type fakeSMClient struct {
-	out *secretsmanager.GetSecretValueOutput
+// fakeResolver is a stand-in for a caller-supplied SecretResolver, the way
+// github.com/jbrahy/gocloak/awssecrets is one in production. Tests use it so
+// the delegation path can be exercised with no store, no credentials and no
+// network.
+type fakeResolver struct {
+	// values maps a whole reference to what resolving it returns.
+	values map[SecretRef]string
+	// err, when non-nil, is returned for any reference not in values.
 	err error
+	// calls records every reference the resolver was asked for, so a test
+	// can assert that file: and env: never reach it.
+	calls []SecretRef
 }
 
-func (f fakeSMClient) GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
-	return f.out, f.err
+func (f *fakeResolver) ResolveSecret(ctx context.Context, ref SecretRef) ([]byte, error) {
+	f.calls = append(f.calls, ref)
+	if v, ok := f.values[ref]; ok {
+		return []byte(v), nil
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	return nil, fmt.Errorf("fakeResolver: no value for %q", string(ref))
 }
 
-// fakeSSMClient is a stand-in for the SSM client, same purpose as fakeSMClient.
-type fakeSSMClient struct {
-	out *ssm.GetParameterOutput
-	err error
-}
+// failingResolver fails the test if it is ever consulted. It is how the
+// "core never delegates file: or env:" rule is asserted.
+type failingResolver struct{ t *testing.T }
 
-func (f fakeSSMClient) GetParameter(ctx context.Context, params *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
-	return f.out, f.err
+func (f failingResolver) ResolveSecret(ctx context.Context, ref SecretRef) ([]byte, error) {
+	f.t.Helper()
+	f.t.Fatalf("resolver was consulted for %q, which this package resolves itself", string(ref))
+	return nil, nil
 }
 
 func TestSecretResolve(t *testing.T) {
@@ -51,25 +60,19 @@ func TestSecretResolve(t *testing.T) {
 
 	t.Setenv("GOCLOAK_TEST_SECRET", "env-secret-value")
 
-	working := &secretResolver{
-		sm: fakeSMClient{
-			out: &secretsmanager.GetSecretValueOutput{
-				SecretString: aws.String("sm-secret-value"),
-			},
-		},
-		ssm: fakeSSMClient{
-			out: &ssm.GetParameterOutput{
-				Parameter: &ssmtypes.Parameter{
-					Value: aws.String("ssm-secret-value"),
-				},
-			},
-		},
-	}
+	// working delegates the two AWS schemes the awssecrets module
+	// implements, which is what a program wiring that module in has.
+	working := &secretResolver{external: &fakeResolver{values: map[SecretRef]string{
+		"aws:sm:gocloak/server/private":   "sm-secret-value",
+		"aws:ssm:/gocloak/server/private": "ssm-secret-value",
+		"vault:secret/gocloak":            "vault-secret-value",
+	}}}
 
-	failing := &secretResolver{
-		sm:  fakeSMClient{err: errors.New("access denied")},
-		ssm: fakeSSMClient{err: errors.New("access denied")},
-	}
+	failing := &secretResolver{external: &fakeResolver{err: errors.New("access denied")}}
+
+	// bare has no Resolver at all: file: and env: work, everything else
+	// is an error rather than a fallback.
+	bare := &secretResolver{}
 
 	tests := []struct {
 		name     string
@@ -78,22 +81,30 @@ func TestSecretResolve(t *testing.T) {
 		want     string
 		wantErr  bool
 	}{
-		{name: "aws sm success", ref: "aws:sm:gocloak/server/private", resolver: working, want: "sm-secret-value"},
-		{name: "aws sm backend error", ref: "aws:sm:gocloak/server/private", resolver: failing, wantErr: true},
-		{name: "aws ssm success", ref: "aws:ssm:/gocloak/server/private", resolver: working, want: "ssm-secret-value"},
-		{name: "aws ssm backend error", ref: "aws:ssm:/gocloak/server/private", resolver: failing, wantErr: true},
+		{name: "aws sm delegated", ref: "aws:sm:gocloak/server/private", resolver: working, want: "sm-secret-value"},
+		{name: "aws sm resolver error", ref: "aws:sm:gocloak/server/private", resolver: failing, wantErr: true},
+		{name: "aws ssm delegated", ref: "aws:ssm:/gocloak/server/private", resolver: working, want: "ssm-secret-value"},
+		{name: "aws ssm resolver error", ref: "aws:ssm:/gocloak/server/private", resolver: failing, wantErr: true},
+		{name: "third party scheme delegated", ref: "vault:secret/gocloak", resolver: working, want: "vault-secret-value"},
+		{name: "aws sm with no resolver", ref: "aws:sm:gocloak/server/private", resolver: bare, wantErr: true},
+		{name: "aws ssm with no resolver", ref: "aws:ssm:/gocloak/server/private", resolver: bare, wantErr: true},
+		{name: "third party scheme with no resolver", ref: "vault:secret/gocloak", resolver: bare, wantErr: true},
 		{name: "file success", ref: SecretRef("file:" + okFile), resolver: working, want: "file-secret-value"},
 		{name: "file rejects 0644", ref: SecretRef("file:" + looseFile), resolver: working, wantErr: true},
 		{name: "file missing", ref: SecretRef("file:" + missingFile), resolver: working, wantErr: true},
+		{name: "file success with no resolver", ref: SecretRef("file:" + okFile), resolver: bare, want: "file-secret-value"},
 		{name: "env success", ref: "env:GOCLOAK_TEST_SECRET", resolver: working, want: "env-secret-value"},
 		{name: "env unset", ref: "env:GOCLOAK_TEST_SECRET_UNSET", resolver: working, wantErr: true},
-		{name: "unknown scheme", ref: "ftp:example.com/secret", resolver: working, wantErr: true},
+		{name: "env success with no resolver", ref: "env:GOCLOAK_TEST_SECRET", resolver: bare, want: "env-secret-value"},
+		{name: "unknown scheme", ref: "ftp:example.com/secret", resolver: bare, wantErr: true},
 		{name: "empty reference", ref: "", resolver: working, wantErr: true},
 		{name: "missing colon", ref: "nocolonhere", resolver: working, wantErr: true},
 		{name: "empty payload file", ref: "file:", resolver: working, wantErr: true},
 		{name: "empty payload env", ref: "env:", resolver: working, wantErr: true},
 		{name: "empty payload aws sm", ref: "aws:sm:", resolver: working, wantErr: true},
 		{name: "unknown aws subscheme", ref: "aws:kms:foo", resolver: working, wantErr: true},
+		{name: "scheme with an uppercase letter", ref: "AWS:sm:foo", resolver: working, wantErr: true},
+		{name: "scheme starting with a digit", ref: "1file:/tmp/x", resolver: working, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -102,6 +113,9 @@ func TestSecretResolve(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("Resolve(%q) = %v, want error", tt.ref, got)
+				}
+				if len(got.bytes()) != 0 {
+					t.Fatalf("Resolve(%q) returned key material alongside an error", tt.ref)
 				}
 				return
 			}
@@ -113,6 +127,125 @@ func TestSecretResolve(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSecretNativeSchemesNeverReachTheResolver pins the resolution order:
+// file: and env: are resolved in this package and a configured Resolver is
+// never consulted for them, so a Resolver cannot take over the two schemes
+// that need no dependency to resolve.
+func TestSecretNativeSchemesNeverReachTheResolver(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "key")
+	if err := os.WriteFile(path, []byte("file-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOCLOAK_TEST_NATIVE", "env-value")
+
+	r := &secretResolver{external: failingResolver{t: t}}
+
+	got, err := r.Resolve(context.Background(), SecretRef("file:"+path))
+	if err != nil {
+		t.Fatalf("Resolve(file:) unexpected error: %v", err)
+	}
+	if string(got.bytes()) != "file-value" {
+		t.Fatalf("Resolve(file:) = %q, want %q", got.bytes(), "file-value")
+	}
+
+	got, err = r.Resolve(context.Background(), "env:GOCLOAK_TEST_NATIVE")
+	if err != nil {
+		t.Fatalf("Resolve(env:) unexpected error: %v", err)
+	}
+	if string(got.bytes()) != "env-value" {
+		t.Fatalf("Resolve(env:) = %q, want %q", got.bytes(), "env-value")
+	}
+}
+
+// TestSecretUnknownSchemeWithNoResolverExplainsItself covers the error an
+// operator actually hits after the AWS schemes moved out of this module: it
+// has to name what this package does resolve and say that anything else
+// needs a Resolver, without echoing the payload, which may be a pasted
+// secret.
+func TestSecretUnknownSchemeWithNoResolverExplainsItself(t *testing.T) {
+	const payload = "gocloak/server/private"
+	r := &secretResolver{}
+
+	_, err := r.Resolve(context.Background(), SecretRef("aws:sm:"+payload))
+	if err == nil {
+		t.Fatal("resolving an aws:sm: reference with no Resolver succeeded, want an error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"file:", "env:", "Resolver", "awssecrets"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, payload) {
+		t.Errorf("error echoes the reference payload, which may be a pasted secret: %v", err)
+	}
+}
+
+// TestSecretResolverErrorDoesNotCarryKeyMaterial proves this package never
+// puts a resolved value into an error, including the case of a Resolver
+// that hands back both a value and an error.
+func TestSecretResolverErrorDoesNotCarryKeyMaterial(t *testing.T) {
+	const value = "SUPERSECRETKEYMATERIAL"
+
+	r := &secretResolver{external: resolverFunc(func(ctx context.Context, ref SecretRef) ([]byte, error) {
+		return []byte(value), errors.New("store unavailable")
+	})}
+
+	got, err := r.Resolve(context.Background(), "vault:secret/gocloak")
+	if err == nil {
+		t.Fatal("a Resolver that returned an error resolved successfully")
+	}
+	if len(got.bytes()) != 0 {
+		t.Fatal("a Resolver that returned an error still yielded key material")
+	}
+	if strings.Contains(err.Error(), value) {
+		t.Fatalf("error carries the resolved value: %v", err)
+	}
+}
+
+// TestSecretResolverEmptyValueIsAnError covers a Resolver that reports
+// success with nothing in it. An empty key is not a key, and accepting one
+// would surface later as an unexplained handshake failure.
+func TestSecretResolverEmptyValueIsAnError(t *testing.T) {
+	r := &secretResolver{external: resolverFunc(func(ctx context.Context, ref SecretRef) ([]byte, error) {
+		return nil, nil
+	})}
+	if _, err := r.Resolve(context.Background(), "vault:secret/gocloak"); err == nil {
+		t.Fatal("a Resolver returning no value resolved successfully, want an error")
+	}
+}
+
+// TestSecretDelegatedValueIsRedacted proves a value that came from outside
+// this package is wrapped in secret on receipt, so it inherits the same
+// redaction guarantee as one resolved here.
+func TestSecretDelegatedValueIsRedacted(t *testing.T) {
+	const value = "delegated-key-material"
+	r := &secretResolver{external: resolverFunc(func(ctx context.Context, ref SecretRef) ([]byte, error) {
+		return []byte(value), nil
+	})}
+
+	got, err := r.Resolve(context.Background(), "vault:secret/gocloak")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if string(got.bytes()) != value {
+		t.Fatalf("Resolve = %q, want %q", got.bytes(), value)
+	}
+	for _, repr := range []string{fmt.Sprintf("%v", got), fmt.Sprintf("%#v", got)} {
+		if repr != "[REDACTED]" {
+			t.Fatalf("delegated value renders as %q, want [REDACTED]", repr)
+		}
+	}
+}
+
+// resolverFunc adapts a function to SecretResolver.
+type resolverFunc func(ctx context.Context, ref SecretRef) ([]byte, error)
+
+func (f resolverFunc) ResolveSecret(ctx context.Context, ref SecretRef) ([]byte, error) {
+	return f(ctx, ref)
 }
 
 // TestSecretRejectsLooseFilePermissions is the explicit 0644 rejection case
@@ -134,12 +267,30 @@ func TestSecretRejectsLooseFilePermissions(t *testing.T) {
 
 // TestSecretRejectsUnknownScheme is the explicit unknown-scheme rejection
 // case the brief requires: an unrecognized scheme must error, never fall
-// back to treating the reference as a literal value.
+// back to treating the reference as a literal value. It holds both with no
+// Resolver and with one that does not recognize the scheme either.
 func TestSecretRejectsUnknownScheme(t *testing.T) {
-	r := &secretResolver{}
-	got, err := r.Resolve(context.Background(), "http:not-a-real-scheme")
-	if err == nil {
-		t.Fatalf("Resolve of an unknown scheme did not error, got %v", got)
+	refusing := &fakeResolver{}
+	resolvers := map[string]*secretResolver{
+		"no resolver":      {},
+		"resolver refuses": {external: refusing},
+	}
+	for name, r := range resolvers {
+		t.Run(name, func(t *testing.T) {
+			got, err := r.Resolve(context.Background(), "http:not-a-real-scheme")
+			if err == nil {
+				t.Fatalf("Resolve of an unknown scheme did not error, got %v", got)
+			}
+			if string(got.bytes()) == "http:not-a-real-scheme" {
+				t.Fatal("Resolve treated an unknown reference as a literal value")
+			}
+		})
+	}
+	// The Resolver, when there is one, is the thing that got to refuse:
+	// an unknown scheme is delegated before it is rejected, so a caller
+	// can add http: support without this package changing.
+	if len(refusing.calls) != 1 || refusing.calls[0] != "http:not-a-real-scheme" {
+		t.Fatalf("resolver calls = %v, want the unknown reference delegated once", refusing.calls)
 	}
 }
 
