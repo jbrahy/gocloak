@@ -36,18 +36,18 @@ Read the open items first.
 1. docs/finish.md task 10 item 2 claimed a client with a correct static key but the wrong
    PSK would receive zero bytes back. Noise IKpsk2 mixes the PSK into message 2, not
    message 1, so the server answers with a handshake response before the PSK is consulted.
-   Found by the task 10 implementer, corrected in commit a2220c2, and independently
+   Found by the task 10 implementer, corrected in the task 10 fix round, and independently
    confirmed against the pinned wireguard-go source by its reviewer.
 
 2. The task 7 brief specified rate limits after the hello read. That left the window before
    the hello read unbounded, so the per-peer concurrency cap bound nothing and one peer
    could starve every other. Found because the reviewer was told not to assume the brief
-   was correct. Fixed in commit 6a9fec9.
+   was correct. Fixed in the task 7 fix round.
 
 ## Rulings taken without the owner
 
 RULING: Work proceeds on branch `build/gocloak-v1` in the primary working
-directory, not a git worktree — the repo is one commit old with no other work
+directory, not a git worktree, because the repo is one commit old with no other work
 in flight, so a worktree buys no isolation and adds a directory the user did
 not ask for. Cost if wrong: none material; the branch is still revertible.
 
@@ -88,7 +88,7 @@ RULING: no second writer runs while an implementer holds the repo. Two agents co
   concurrently race on .git/index.lock. Reviewers are read-only and may overlap freely.
   Cost if wrong: some serialized wall-clock that could have been parallel.
 Task 3: implementer stalled waiting on a backgrounded fuzz job, returned no status. Files written, uncommitted, no crash corpus. Resumed with instruction to run the fuzz in the foreground.
-Task 3: implemented DONE (commit 0ccbb84) — 13 test funcs pass, fuzz 5,303,883 execs no crash, vet+gofmt clean
+Task 3: implemented DONE: 13 test funcs pass, fuzz 5,303,883 execs no crash, vet+gofmt clean
 --
 RULING: every later task brief now carries an explicit test-naming warning. The goal doc's
   verification commands use `-run TestX` substring filters, and task 4 proved a mis-named test
@@ -104,7 +104,7 @@ RULING: Minor G is assigned to task 5 (config.go), not task 4. policy.go takes a
   and has no knowledge of the server's own tunnel IP; config.go owns the operator-facing YAML and
   does know it. Sent to the running task 5 agent as an addition. Cost if wrong: the check lands
   one file away from where a reader might look for it.
-Task 5: implemented DONE (commit b30e6e0) — LoadServerConfig/LoadPeersConfig/PeerWatcher, 61 TestConfig runs under -race incl. malformed-reload-keeps-old-policy, rename replacement x2 rounds, debounce, concurrent reads
+Task 5: implemented DONE: LoadServerConfig/LoadPeersConfig/PeerWatcher, 61 TestConfig runs under -race incl. malformed-reload-keeps-old-policy, rename replacement x2 rounds, debounce, concurrent reads
 --
 RULING: fix round for task 5 takes Important H plus minors I, J, K. H is a constraint-4 violation.
   I is a one-line ordering correctness fix matching a correct pattern ten lines below it. J is
@@ -134,7 +134,7 @@ RULING: my own brief for task 7 specified an authorization order that left the p
   unbounded. The review caught it because I explicitly told the reviewer not to assume my ordering
   was correct. Recording this because the brief, not the implementer, was the defect source.
   Cost if wrong: none, the correction is strictly more restrictive.
-Task 5: fix round 2/5 applied (commit 8958950) — three-way classification, 78 TestConfig runs (up from 68). Implementer proved non-vacuity TWICE: short-circuiting the new branch, and applying the forbidden naive whitelist to watch the secret-key test leak the WHOLE key. It also reported that two premises in my instructions did not hold when it probed yaml.v3 v3.0.1, rather than quietly working around them.
+Task 5: fix round 2/5 applied: three-way classification, 78 TestConfig runs (up from 68). Implementer proved non-vacuity TWICE: short-circuiting the new branch, and applying the forbidden naive whitelist to watch the secret-key test leak the WHOLE key. It also reported that two premises in my instructions did not hold when it probed yaml.v3 v3.0.1, rather than quietly working around them.
 --
 RULING: adopt (c) with exactly that guard, as task 5 fix round 3. It closes a full-key leak that is
   worse than the 7-char prefix the original finding leaked, while preserving the unknown-key
@@ -164,7 +164,7 @@ RULING: task 9 fix round takes Y plus minors Z, AA, AB. Z is pulled because an u
   the key file can produce a zero-length key that the O_EXCL guard then permanently refuses to
   regenerate, which is a self-inflicted outage with no recovery path short of manual deletion.
   Cost if wrong: churn in a passing CLI.
-Task 8: fix round 1/5 applied (commit 1870970) — all three findings, each mutation-verified (deleting the `if !stop()` block fails both U tests, deleting the ctx.Deadline() carry fails V, restoring measured elapsed time fails W). 19 TestClient tests, whole suite 104s.
+Task 8: fix round 1/5 applied: all three findings, each mutation-verified (deleting the `if !stop()` block fails both U tests, deleting the ctx.Deadline() carry fails V, restoring measured elapsed time fails W). 19 TestClient tests, whole suite 104s.
 --
 RULING: fix AD by raising the `go` directive from 1.26.5 to 1.26.6 alongside the existing toolchain
   line. That converts "silently builds against a vulnerable stdlib" into a hard build failure for
@@ -176,7 +176,7 @@ RULING: task 12's two README minors are NOT given their own fix round. They are 
   final whole-branch review's single fix wave, which is the structure this process prescribes and
   avoids a separate dispatch for two sentences in one file. Cost if wrong: two small imprecisions
   live in the README until the final wave lands.
-Task 11: fix round 1/5 applied (commit 0a371c4) — `go` directive raised to 1.26.6. go mod tidy auto-elided the now-redundant `toolchain go1.26.6` line, which the implementer kept rather than fighting back in.
+Task 11: fix round 1/5 applied: the `go` directive raised to 1.26.6. go mod tidy auto-elided the now-redundant `toolchain go1.26.6` line, which the implementer kept rather than fighting back in.
 --
 RULING: the final review's Important 3 (exported surface is ~4x what any consumer uses) is SCOPED
   DOWN in the fix wave to unexporting Secret.Bytes() only, and the broader reduction is PARKED FOR

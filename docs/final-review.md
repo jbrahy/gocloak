@@ -1,7 +1,8 @@
 # goCloak final review
 
 Date: 2026-09-10
-Reviewed at commit e9649bd, the tip of the former `build/gocloak-v1`.
+Reviewed at the tip of the former `build/gocloak-v1` branch, the commit that
+recorded the build's decisions and open items.
 Reviewer had no prior context on the build: independent eyes on the finished product.
 
 Repository state at the time of writing: the branch was fast-forward merged into `main`

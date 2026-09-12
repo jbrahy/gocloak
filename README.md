@@ -10,10 +10,44 @@ port. It is for operators who need an application outside a VPC to reach a
 small, fixed set of services inside one, without a bastion host, without a TUN
 device, without root, and without a certificate authority.
 
-Before you deploy it, read
-[What goCloak does not protect against](#what-gocloak-does-not-protect-against).
-That section is short, and it is the part that decides whether this tool fits
-your threat model.
+Everything runs in userspace: WireGuard
+(`Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`) via wireguard-go, and TCP via gVisor
+netstack, both inside the process.
+
+## Maturity: read this before you evaluate goCloak for real use
+
+**This code has never been externally audited.** No security review by anyone
+outside the project, no penetration test, no formal verification of any part of
+it.
+
+**It has no production deployment.** Nobody is running this in anger. There is
+no operational track record, no uptime history, and no incident experience to
+learn from.
+
+**It has been exercised only on loopback and in one live local run.** The test
+suite brings up real WireGuard tunnels and real netstack TCP, and it is
+thorough, but every one of those runs is a single machine talking to itself.
+goCloak has not been run across a real network, at scale, under load, behind a
+real NAT, or against a real database.
+
+What that does and does not mean. The cryptography is wireguard-go's,
+unmodified, and that is a well-reviewed implementation of a well-reviewed
+protocol. The code goCloak actually owns is the policy engine, the hello frame
+parser, the config loader and the proxy, and those are the parts that carry the
+risk of an unaudited project. Read them: they are deliberately small.
+
+If you need a hardened, audited, battle-tested tunnel today, use one that is.
+If you are evaluating goCloak, evaluate it as what it is: a carefully built,
+carefully documented, entirely unproven piece of software.
+
+## Documentation
+
+| Document | What it is for |
+|---|---|
+| [docs/integration-guide.md](docs/integration-guide.md) | Using goCloak: install, keys, config, `database/sql` and `http.Transport`, the error model, operations, troubleshooting a handshake that never completes |
+| [docs/implementation.md](docs/implementation.md) | Contributing to goCloak: the layers, a file by file tour, the path of one connection, the invariants |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to build, test, lint, and what the bar for a change is. Also how to report a vulnerability |
+| [docs/superpowers/specs/2026-09-09-gocloak-design.md](docs/superpowers/specs/2026-09-09-gocloak-design.md) | The binding design spec: architecture, wire protocol, public API, threat model, failure handling |
 
 ## Architecture
 
@@ -39,12 +73,10 @@ LOCAL APP                          HOSTILE INTERNET              PRIVATE VPC
                                          192.0.2.10:3306
 ```
 
-Everything is userspace. WireGuard
-(`Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`) is provided by wireguard-go and TCP
-by gVisor netstack, both inside the process. There is no TUN device, no root,
-and no `CAP_NET_ADMIN`. goCloak itself writes no cryptography and no transport:
-the security-critical code in this repository is the policy engine and the
-hello frame parser, and both are small enough to read in one sitting.
+There is no TUN device, no root, and no `CAP_NET_ADMIN`. goCloak itself writes
+no cryptography and no transport: the security-critical code in this repository
+is the policy engine and the hello frame parser, and both are small enough to
+read in one sitting.
 
 Each peer owns one address in `10.99.0.0/24`, pinned by WireGuard cryptokey
 routing to its keypair. The server holds `10.99.0.1`, which caps a deployment
@@ -56,134 +88,96 @@ lookup keys off it.
 The client never learns a backend address. It sends a service name over the
 tunnel, the server resolves that name against this peer's allow map, and the
 connection becomes a raw byte pipe. Backends move without touching any client.
+Authorization is default deny: there is no wildcard, no CIDR and no port range,
+and absence is denial.
 
-## Five minute quickstart
+## Quickstart
 
-### 1. Build the CLI
+This runs a whole tunnel on one machine in about a minute: a backend, a server,
+and a client that sends a message through it. Every command below was run as
+written, with the one placeholder in step 3 replaced by what step 2 printed.
 
-```
-go install github.com/jbrahy/gocloak/cmd/gocloak@latest
-```
-
-Or from a checkout:
-
-```
-go build -o gocloak ./cmd/gocloak
-```
-
-### 2. Mint keys
-
-Run keygen once for the server and once for each peer. `--name` must match
-`[a-z0-9][a-z0-9-]{0,62}`, the same charset a peer name and a service name use.
+### 1. Build
 
 ```
-gocloak keygen --name server --dir /etc/gocloak
-gocloak keygen --name app-01 --dir /etc/gocloak
+git clone https://github.com/jbrahy/gocloak && cd gocloak
+make build
 ```
 
-Each run writes `<name>.key` and `<name>.psk` at mode 0600, refuses to
-overwrite an existing file, and prints:
+That puts `gocloak`, `gocloak-sink` and `gocloak-send` in `bin/`.
+
+### 2. Mint keys into a scratch directory
 
 ```
+export DEMO=$(mktemp -d)
+bin/gocloak keygen --name server --dir "$DEMO"
+bin/gocloak keygen --name app-01 --dir "$DEMO"
+```
+
+```
+peer: server
+public_key: lv7sINDEP2auW5+l46h3aWpttdKaUQSDLudoIoTp6xg=
+psk: gmUxI7nfYK8FdhohMU0cw14WMHG0YNMrwICg58yvA5o=
+private key written to: /tmp/.../server.key
+psk written to: /tmp/.../server.psk
+
 peer: app-01
-public_key: 7T4dP1sVQ0zK8mJ9c3rW5hLxB2nY6uA0eF+iG4kS1oM=
-psk: hN2q8XvR6cD1yP4mZ0tK7aW3sU9bE5jL8gO+fH2iC6Y=
-private key written to: /etc/gocloak/app-01.key
-psk written to: /etc/gocloak/app-01.psk
+public_key: dT8xTJL1IthNgUwCuqLxblFAdmsHkI6WKh9+Gvwa4Qg=
+psk: PHFcwgmV3FfO7YeCTtiDIVwvKm4qLOVu34hVBv/qcPk=
+private key written to: /tmp/.../app-01.key
+psk written to: /tmp/.../app-01.psk
 ```
 
-`--dir` is optional and defaults to the current directory. The private key is
-never printed, only the path it was written to.
+Each run writes `<name>.key` and `<name>.psk` at mode 0600 and refuses to
+overwrite an existing file. The private key is never printed, only the path it
+was written to. The `psk:` line is the one place this tool ever prints a live
+secret, so treat that terminal as sensitive.
 
-The `psk:` line is the one place this tool ever emits a live secret, so treat
-that terminal as sensitive: the value lands in scrollback, in any session
-recording or CI job log, and in shell history if you pipe or re-echo it. Move
-it into your secret store and clear the scrollback rather than leaving it
-sitting in a window.
-
-Once the private key and PSK are loaded into your secret store, delete the
-`.key` and `.psk` files. They are the only key material this tool puts at rest,
-and the property table below holds only once they are gone.
-
-The peer's `public_key` goes into `peers.yaml` verbatim. The peer's PSK goes
-into your secret store, and `peers.yaml` carries a reference to it, not the
-value. The peer's own `.key` and `.psk` files go to the peer host. The server's
-own `.psk` file is not used at all: a PSK belongs to a peer relationship, and
+`server.psk` is not used by anything: a PSK belongs to a peer relationship, and
 the server takes each peer's PSK from `peers.yaml`.
 
-### 3. Write `server.yaml`
+### 3. Write the two config files
 
-```yaml
+```
+cat > "$DEMO/server.yaml" <<EOF
 listen_port: 51820
-private_key: aws:sm:gocloak/server/private
+private_key: file:$DEMO/server.key
 tunnel_ip: 10.99.0.1
 mtu: 1280
-peers_file: /etc/gocloak/peers.yaml
-log_format: json
+peers_file: $DEMO/peers.yaml
+log_format: text
+EOF
 ```
 
-Every key is required except `mtu` (default 1280) and `log_format` (default
-`json`, the alternative is `text`). `tunnel_ip` must be `10.99.0.1`. An
-unrecognized key is a hard error, never a silent ignore: a typo in a
-security-relevant key must fail loudly rather than quietly granting or revoking
-access.
-
-`aws:sm:` is the production form for `private_key`. To get a first deployment
-running without AWS, point it at the file keygen just wrote:
-`private_key: file:/etc/gocloak/server.key`. See
-[Operational essentials](#operational-essentials) for every reference scheme.
-
-### 4. Write `peers.yaml`
-
-```yaml
+```
+cat > "$DEMO/peers.yaml" <<EOF
 peers:
   - name: app-01
-    public_key: 7T4dP1sVQ0zK8mJ9c3rW5hLxB2nY6uA0eF+iG4kS1oM=
-    psk: aws:sm:gocloak/peers/app-01
+    public_key: PASTE_THE_app-01_public_key_HERE
+    psk: file:$DEMO/app-01.psk
     tunnel_ip: 10.99.0.7
     limits:
       max_concurrent: 32
       dials_per_second: 10
     allow:
       primary-db: 127.0.0.1:19000
-      cache: 192.0.2.11:6379
+EOF
 ```
 
-`name`, `public_key`, `psk` and `tunnel_ip` are required per peer. `limits` is
-optional and defaults to `max_concurrent: 32` and `dials_per_second: 10`.
+`tunnel_ip` in `server.yaml` must be `10.99.0.1`. Every `allow` entry is one
+service name granted to one literal `ip:port`: a hostname is rejected at load
+time, because nothing in this project resolves names. An unrecognized key
+anywhere in either file is a hard error, never a silent ignore.
 
-Everything under `allow` is an explicit grant of one service name to one
-literal `ip:port`. A hostname is rejected at load time, because nothing in this
-project resolves names. There is no wildcard, no CIDR and no port range.
-Absence is denial, and a peer with no `allow` map can reach nothing.
+In production, `private_key` and `psk` would be `aws:sm:` references rather
+than `file:` ones.
 
-The `primary-db` grant above points at `127.0.0.1:19000`, which is
-`gocloak-sink`'s default `--listen` address: the two example apps in step 6
-below use this exact `peers.yaml`. In a real deployment `primary-db` would
-instead point at the actual database, for example `192.0.2.10:3306`.
-
-### 5. Run the server
-
-```
-gocloak serve --config /etc/gocloak/server.yaml
-```
-
-`--config` is the only flag, and it is required. The process opens exactly one
-port to the internet, the UDP `listen_port`. It fails closed: an unreachable
-secret store, a malformed config or an unreadable key at startup exits non-zero
-rather than starting degraded, so systemd backs off and retries.
-
-### 6. Try it with the example apps
-
-`cmd/gocloak-sink` and `cmd/gocloak-send` are two small binaries built from
-this repository, useful for testing a deployment before wiring up a real
-application. Build them, and the CLI, with `make build`, which puts all
-three under `bin/`.
+### 4. Start a backend and the server
 
 `gocloak-sink` is a plain TCP service. It is deliberately **not** a goCloak
-peer: it speaks no tunnel protocol, and it is the same kind of ordinary
-backend the database is in the diagram above. Start it listening on the
-address `peers.yaml` already grants `primary-db` to:
+peer: it speaks no tunnel protocol, and it stands in for the ordinary backend
+in the diagram above. Start it on the address `peers.yaml` grants to
+`primary-db`:
 
 ```
 bin/gocloak-sink --listen 127.0.0.1:19000
@@ -193,125 +187,101 @@ bin/gocloak-sink --listen 127.0.0.1:19000
 gocloak-sink: listening on 127.0.0.1:19000 (plain TCP, not a goCloak peer)
 ```
 
-In another terminal, start the server from step 5 if it is not already
-running, then send a message with `gocloak-send`, a real goCloak client.
-Every flag takes a reference or a literal value the server also holds; none
-of them are optional:
+In another terminal:
+
+```
+bin/gocloak serve --config "$DEMO/server.yaml"
+```
+
+```
+level=INFO msg="gocloak: starting" config=/tmp/.../server.yaml
+level=INFO msg="gocloak: server listening" listen_port=51820 tunnel_ip=10.99.0.1 mtu=1280 peers_file=/tmp/.../peers.yaml peers=1
+```
+
+The process opens exactly one port to the internet, the UDP `listen_port`. It
+fails closed: an unreachable secret store, a malformed config or an unreadable
+key at startup exits non-zero rather than starting degraded.
+
+You will also see an ERROR line every few seconds for any peer that has not yet
+connected: `Failed to send handshake initiation: no known endpoint for peer`.
+That is a known, tracked defect in idle-peer logging, not a sign anything is
+broken. It is [a good first contribution](CONTRIBUTING.md#1-the-idle-peer-handshake-log-storm).
+
+### 5. Send a message through the tunnel
+
+In a third terminal, with `--server-key` set to the server public key from
+step 2:
 
 ```
 bin/gocloak-send \
   --endpoint 127.0.0.1:51820 \
-  --server-key E8vwqazY4tBKwTCemvAXSNPYiemQev7HD9Ahyt+/s30= \
-  --key file:/etc/gocloak/app-01.key \
-  --psk file:/etc/gocloak/app-01.psk \
+  --server-key lv7sINDEP2auW5+l46h3aWpttdKaUQSDLudoIoTp6xg= \
+  --key file:"$DEMO"/app-01.key \
+  --psk file:"$DEMO"/app-01.psk \
   --tunnel-ip 10.99.0.7 \
   --service primary-db \
   "hello from the tunnel"
 ```
 
 ```
-sent 21 bytes, ack in 0ms
+sent 21 bytes, ack in 1ms
 ```
 
-`--server-key` is the `public_key` `gocloak keygen --name server` printed;
-`--endpoint` and `--tunnel-ip` match `server.yaml`'s `listen_port` and this
-peer's `tunnel_ip` in `peers.yaml`. `--timeout` is optional and defaults to
-`gocloak.DefaultDialTimeout` (10s). The positional argument is the message.
-`gocloak-sink`'s terminal shows the message arriving, with a timestamp and
-the source address inside the tunnel:
+and the sink's terminal shows it arriving, with the source address inside the
+tunnel:
 
 ```
-2026-09-11T23:02:52-07:00 127.0.0.1:51700: hello from the tunnel
+2026-09-12T07:17:16-07:00 127.0.0.1:62278: hello from the tunnel
 ```
 
-Dialing a service this peer's `allow` map does not grant fails the same way
-a real application's mistake would, with a distinct exit code (`10`) so a
-script can tell it apart from the other failure classes documented in
-`gocloak-send --help`:
+Asking for a service this peer was not granted fails with a distinct exit code
+(`10`), so a script can tell it apart from the other failure classes that
+`gocloak-send --help` documents:
 
 ```
-bin/gocloak-send \
-  --endpoint 127.0.0.1:51820 \
-  --server-key E8vwqazY4tBKwTCemvAXSNPYiemQev7HD9Ahyt+/s30= \
-  --key file:/etc/gocloak/app-01.key \
-  --psk file:/etc/gocloak/app-01.psk \
-  --tunnel-ip 10.99.0.7 \
-  --service not-granted \
-  "this should be denied"
+bin/gocloak-send ... --service not-granted "this should be denied"
 ```
 
 ```
 gocloak-send: denied: this peer's allow map does not grant this service
 ```
 
-`gocloak-send` never prints `--key` or `--psk`, in any output including
-these error paths: they are references to secrets, not values, and the
-point of the example is that a client only ever holds a reference.
+Clean up with `rm -rf "$DEMO"`. Those key files are real key material.
 
-You will see a line like this in the server's log, roughly every 6 seconds,
-for any peer that has not yet completed a handshake: `Failed to send
-handshake initiation: no known endpoint for peer`. That is a known,
-separately tracked issue with idle-peer logging, not a sign anything above
-is broken.
-
-### 7. Dial from your own application
+### 6. Dial from your own application
 
 ```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"io"
-	"net/netip"
-	"time"
-
-	"github.com/jbrahy/gocloak"
-)
-
-func main() {
-	client, err := gocloak.NewClient(gocloak.ClientConfig{
-		Endpoint:     "tunnel.example.com:51820",
-		ServerPubKey: "mF3kQ8vT2xN7pY0aR5cJ1wL6dH9sB4eU+gI2oZ8yK0M=",
-		PrivateKey:   gocloak.SecretRef("file:/etc/gocloak/app-01.key"),
-		PresharedKey: gocloak.SecretRef("aws:sm:gocloak/peers/app-01"),
-		TunnelIP:     netip.MustParseAddr("10.99.0.7"),
-		MTU:          1280,
-		DialTimeout:  10 * time.Second,
-	})
-	if err != nil {
-		panic(err)
-	}
-	defer client.Close()
-
-	conn, err := client.Dial(context.Background(), "primary-db")
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-
-	io.WriteString(conn, "hello from the tunnel\n")
-	fmt.Println("connected")
+client, err := gocloak.NewClient(gocloak.ClientConfig{
+	Endpoint:     "tunnel.example.com:51820",
+	ServerPubKey: "lv7sINDEP2auW5+l46h3aWpttdKaUQSDLudoIoTp6xg=",
+	PrivateKey:   gocloak.SecretRef("file:/etc/gocloak/app-01.key"),
+	PresharedKey: gocloak.SecretRef("aws:sm:gocloak/peers/app-01"),
+	TunnelIP:     netip.MustParseAddr("10.99.0.7"),
+	MTU:          1280,
+	DialTimeout:  10 * time.Second,
+})
+if err != nil {
+	panic(err)
 }
+defer client.Close()
+
+conn, err := client.Dial(context.Background(), "primary-db")
+if err != nil {
+	panic(err)
+}
+defer conn.Close()
 ```
 
-`ServerPubKey` is the `public_key` that `gocloak keygen --name server` printed,
-and it is pinned: it is the only key this client will complete a handshake
-with. `MTU` and `DialTimeout` may be omitted and default to 1280 and 10
-seconds. `Dial` blocks until the WireGuard handshake completes, so an
+`ServerPubKey` is pinned: it is the only key this client will complete a
+handshake with. `MTU` and `DialTimeout` may be omitted and default to 1280 and
+10 seconds. `Dial` blocks until the WireGuard handshake completes, so an
 authentication failure surfaces on the first call rather than as a connection
 that hangs later.
 
 `(*Client).DialContext(ctx, network, addr)` has the standard dialer signature,
 so a `*Client` drops straight into `http.Transport.DialContext` or any database
-driver that accepts a dialer. It ignores `network` and treats `addr` as the
-service name with any `:port` suffix stripped.
-
-`example_test.go` in this repository runs the whole of the above end to end,
-server and client and backend, in one process. `examples_test.go` runs the
-same shape with `internal/msg`'s sink in place of the backend: it is the
-in-process version of step 6, and it fails if the example apps ever drift
-from what this quickstart shows.
+driver that accepts a dialer. Both are worked through in the
+[integration guide](docs/integration-guide.md#5-using-the-connection).
 
 ## Security properties that hold
 
@@ -361,6 +331,9 @@ The cookie mechanism keeps a flood from burning CPU on Curve25519, but nothing
 in this library stops a large enough flood from saturating the link. That is a
 job for the network in front of the endpoint.
 
+And, above all of these, the maturity warning at the top of this document. An
+unaudited implementation of a good design is still unaudited.
+
 ## Deliberate omissions, and what they buy
 
 - **No X.509 and no TLS anywhere.** Zero certificate parsing in the process, so
@@ -401,7 +374,9 @@ gocloak: handshake timeout: no response from tunnel.example.com:51820
 (The message is one line; it is wrapped here to fit.)
 
 When you hit this, go read the server log. That is the only place the answer
-exists. The client cannot narrow it down and will not pretend to.
+exists. The client cannot narrow it down and will not pretend to. The
+integration guide has
+[a procedure for working through the six causes](docs/integration-guide.md#8-troubleshooting-a-handshake-that-never-completes).
 
 Once the tunnel is up, the server does answer with detail, because the peer is
 by then authenticated and the detail leaks nothing to a stranger. Each of these
@@ -416,62 +391,50 @@ is a distinct sentinel, testable with `errors.Is`:
 | `ErrInvalidServiceName` | The name does not match `^[a-z0-9][a-z0-9-]{0,62}$`. Rejected client-side, no packet sent. |
 | `ErrClientClosed` | `Dial` was called after `Close`. |
 
-## Operational essentials
+## Operating it
 
-**Revocation is an edit, not a restart.** `peers.yaml` is watched. Delete a
-peer, save, and the peer is removed from the live WireGuard device; the next
-packet from that key is dropped. There is no restart and no window in which a
-revoked key still works. Adding a peer and changing an `allow` map work the same
-way. A reload that fails to parse or validate keeps the previous good config in
-force and logs loudly, so a typo neither revokes everyone nor widens access.
+The [integration guide](docs/integration-guide.md#7-operations) covers this in
+full. The four things worth knowing before you start:
 
-**MTU defaults to 1280, not the usual 1420, and that is deliberate.** 1280 is
-the IPv6 minimum, which is the largest value guaranteed to cross any path. An
-MTU that is too large for the path blackholes TCP silently, and that is the most
-common reason a userspace WireGuard setup appears hung rather than broken.
-Accepted values are 1280 to 1500. Raise it only if you control the whole path
-and have measured it.
-
-**Secrets are references, never literals.** Both `ClientConfig` and the YAML
-take a `SecretRef`, resolved at startup into memory and never written to disk:
-
-| Reference | Source |
-|---|---|
-| `aws:sm:<secret-id>` | AWS Secrets Manager. This is the production form. |
-| `aws:ssm:<parameter>` | AWS SSM Parameter Store, read `WithDecryption`. |
-| `file:<path>` | File contents. Refused if the mode is looser than 0600. |
-| `env:<VAR>` | Environment variable. |
-
-An unknown scheme is an error, never a fallback to treating the string as a
-literal key. If the secret store is unreachable at startup the server exits
-non-zero rather than starting on a stale peer list, which would keep revoked
-peers alive.
-
-**Rotation is not revocation, and rotation does need a restart.** The server
-resolves each reference once and caches the value for the process lifetime, so
-changing a PSK in place under the same reference is never picked up by a
-reload. Rotate by writing the new value under a new reference and pointing
-`peers.yaml` at that, or restart the server. Revocation is unaffected: it
-removes the peer from the live device rather than depending on the value behind
-a reference.
-
-**A dropped tunnel errors the connections that were on it.** There is no
-transparent per-connection reconnect, because silently re-establishing a
-connection underneath an application reorders or duplicates its bytes. Call
-`Dial` again. `persistent_keepalive_interval` is 25 seconds, which keeps NAT
-bindings alive and detects a dead path quickly. A client that changes network is
-handled by WireGuard roaming: the server relearns the peer's endpoint from its
-first valid authenticated packet.
+- **Revocation is an edit, not a restart.** `peers.yaml` is watched. Delete a
+  peer, save, and it is removed from the live device and its in-flight
+  connections are closed. A reload that fails to parse keeps the previous good
+  config in force and logs loudly, so a typo neither revokes everyone nor
+  widens access.
+- **Secrets are references, never literals**: `aws:sm:`, `aws:ssm:`, `file:`
+  (refused above mode 0600) and `env:`. An unknown scheme is an error, never a
+  fallback to treating the string as a literal key.
+- **Rotation is not revocation, and rotation needs a restart.** Each reference
+  is resolved once and cached for the process lifetime, so changing a secret in
+  place under an unchanged reference is never picked up by a reload. Rotate by
+  writing the new value under a new reference and pointing `peers.yaml` at it.
+- **MTU defaults to 1280, not the usual 1420, and that is deliberate.** 1280 is
+  the IPv6 minimum, the largest value guaranteed to cross any path. Too large
+  an MTU blackholes TCP silently, which is the most common reason a userspace
+  WireGuard setup appears hung rather than broken.
 
 ## Development
 
 ```
-make test    # go test -race ./...
+make test    # go test -race ./... , about 200 seconds
 make lint    # go vet and staticcheck
 make fuzz    # fuzz the hello frame parser
 make vuln    # govulncheck
 make build   # build gocloak, gocloak-sink and gocloak-send into bin/
 ```
 
-`go test -run Example ./...` runs a real tunnel, a real server and a real
-backend in one process, end to end.
+`go test -run '^Example$' -v .` runs a real tunnel, a real server and a real
+backend in one process, end to end, in about five seconds.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the bar a change has to meet, and
+[docs/implementation.md](docs/implementation.md) for how the internals fit
+together.
+
+## Security
+
+Please do not open a public issue for a vulnerability. See
+[CONTRIBUTING.md](CONTRIBUTING.md#reporting-a-security-vulnerability).
+
+## Licence
+
+MIT. See [LICENSE](LICENSE). Copyright 2026 John Brahy.
