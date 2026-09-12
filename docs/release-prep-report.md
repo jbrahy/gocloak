@@ -107,7 +107,7 @@ diffs, and the no em dashes and no emojis style rule.
 
 Security reporting says plainly not to open a public issue for a vulnerability
 and not to send a pull request that fixes one, and points at
-`<SECURITY_CONTACT_EMAIL>`, a placeholder for the owner to fill in rather than
+GitHub private vulnerability reporting (resolved after this report; it was briefly a placeholder rather than
 an invented address.
 
 Good first contributions, all drawn from genuinely open items:
@@ -328,7 +328,7 @@ which is the roughly six second cadence the bug report describes.
 - **Nothing across a real network.** Every run in this session was loopback on
   one machine. That is exactly why the README's maturity section says so.
 - **The security contact address.** `CONTRIBUTING.md` carries the placeholder
-  `<SECURITY_CONTACT_EMAIL>` rather than an invented address. The owner must
+  GitHub private vulnerability reporting, resolved after this report. Originally a placeholder rather than an invented address; the owner had to
   fill this in before the repository is made public, otherwise a reporter has
   nowhere to send a vulnerability and the instruction not to file a public
   issue becomes an instruction to do nothing.
@@ -342,7 +342,7 @@ which is the roughly six second cadence the bug report describes.
 
 ## 9. Owner checklist before making the repository public
 
-1. Fill in `<SECURITY_CONTACT_EMAIL>` in `CONTRIBUTING.md`.
+1. RESOLVED: vulnerability reports now route through GitHub private advisories.
 2. Confirm the address scrub is complete to your own satisfaction. Grepping
    the working tree for the internal prefix prints nothing, but grepping
    `git log -p` for it still matches 68 lines, because this pass changed the
