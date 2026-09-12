@@ -164,6 +164,18 @@ service name with any `:port` suffix stripped.
 `Dial` blocks until the tunnel handshake completes, so the first call surfaces
 an authentication failure rather than hanging on a half-open connection.
 
+**Amended in v0.2.0.** `Endpoint` was resolved exactly once, at construction,
+which meant an endpoint whose address changed could only be recovered from by
+destroying the `Client` and building another. That is expensive for every
+integrator to get right, because a `Client` is documented as safe for
+concurrent use and would have to be swapped out from underneath its own
+concurrent users. A `Dial` that cannot bring the tunnel up now re-resolves the
+name once and, if it yields a different address, moves the device peer onto it
+before the remaining attempts. A dial that succeeds does no lookup, an IP
+literal is never looked up, and a re-resolution that fails or returns nothing
+fails the dial rather than falling back to an address that cannot be
+confirmed. The public API is unchanged.
+
 ## 6. Configuration
 
 YAML is decoded with `KnownFields(true)`. An unrecognized key is a hard error,
@@ -317,8 +329,9 @@ ErrHandshakeTimeout: no response from <endpoint> after <d>.
 | `peers.yaml` malformed on reload | Parse and validate fully, then swap atomically. On any error keep the previous good config in memory and log loudly. A typo must neither revoke everyone nor widen access. |
 | Service not in the peer's allowlist | Status `0x01`, connection closed, logged server-side as a security event with peer and requested name. |
 | Backend unreachable | Status `0x02`, so the application distinguishes denial from an unhealthy backend. |
-| Tunnel drops mid-session | Existing conns error out. No transparent per-connection reconnect, which would silently reorder or duplicate application bytes. The application retries via `Dial`. `persistent_keepalive_interval=25` keeps NAT bindings alive and detects death quickly. |
+| Tunnel drops mid-session | Existing conns error out. No transparent per-connection reconnect, which would silently reorder or duplicate application bytes. The application retries via `Dial`. `persistent_keepalive_interval=25` keeps NAT bindings alive and detects death quickly. Amended in v0.2.0: it is applied only to a peer that has an endpoint, which is the client's peer, never the server's. A peer with no endpoint has nowhere to send a keepalive, so the timer only produces an ERROR line every few seconds; and the binding to keep open belongs to the side behind the NAT, which is the side that knows its peer's address. |
 | Client changes network | Handled by WireGuard. The server updates the peer endpoint on the first valid authenticated packet from the new address. |
+| Endpoint's address changes (v0.2.0) | Followed by the client, but only once something is already wrong. A `Dial` that cannot bring the tunnel up re-resolves a name endpoint once and moves the peer if the address changed. No lookup on a dial that succeeds, none ever for an IP literal, and a failed re-resolution fails the dial. See section 5. |
 | Path MTU too small | Default MTU is 1280, the IPv6 minimum, not the usual 1420. A too-large MTU blackholes TCP silently and is the most common reason a userspace WireGuard setup appears hung. |
 | Abusive authenticated peer | Per-peer caps on concurrent streams and dials per second, default deny beyond the cap, status `0x03`. |
 

@@ -205,11 +205,6 @@ The process opens exactly one port to the internet, the UDP `listen_port`. It
 fails closed: an unreachable secret store, a malformed config or an unreadable
 key at startup exits non-zero rather than starting degraded.
 
-You will also see an ERROR line every few seconds for any peer that has not yet
-connected: `Failed to send handshake initiation: no known endpoint for peer`.
-That is a known, tracked defect in idle-peer logging, not a sign anything is
-broken. It is [a good first contribution](CONTRIBUTING.md#1-the-idle-peer-handshake-log-storm).
-
 ### 5. Send a message through the tunnel
 
 In a third terminal, with `--server-key` set to the server public key from
@@ -289,6 +284,12 @@ handshake with. `MTU` and `DialTimeout` may be omitted and default to 1280 and
 10 seconds. `Dial` blocks until the WireGuard handshake completes, so an
 authentication failure surfaces on the first call rather than as a connection
 that hangs later.
+
+`Endpoint` may be a name or an IP literal. A name is resolved at construction,
+and resolved again by a `Dial` that cannot bring the tunnel up, so a client
+whose endpoint has been readdressed recovers by being dialled again rather than
+by being rebuilt. A dial that succeeds does no lookup, and an IP literal is
+never looked up at all. A re-resolution that fails, fails the dial.
 
 `(*Client).DialContext(ctx, network, addr)` has the standard dialer signature,
 so a `*Client` drops straight into `http.Transport.DialContext` or any database

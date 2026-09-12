@@ -25,9 +25,10 @@ const (
 	deviceLogVerbose = device.LogLevelVerbose
 )
 
-// keepaliveInterval is the persistent keepalive applied to every peer, in
-// seconds. Spec section 8.2: it keeps NAT bindings alive and makes a dead
-// tunnel visible quickly instead of hanging.
+// keepaliveInterval is the persistent keepalive, in seconds, applied to
+// every peer that has an endpoint. Spec section 8.2: it keeps NAT bindings
+// alive and makes a dead tunnel visible quickly instead of hanging. See
+// devicePeer.ipcConfig for why a peer with no endpoint does not get one.
 const keepaliveInterval = 25
 
 // deviceOptions is everything needed to bring up one userspace WireGuard
@@ -202,6 +203,32 @@ func (d *tunnelDevice) RemovePeer(publicKey string) error {
 	return nil
 }
 
+// SetPeerEndpoint moves an existing peer's endpoint, and changes nothing
+// else about it. The client uses it when its server endpoint's name resolves
+// somewhere new; see Client.refreshEndpoint.
+//
+// update_only, so this can only ever move a peer that exists. A typo in a
+// public key here must fail to find its peer, never bring a new one into
+// existence with an endpoint and no allowed IP, which is the fail-closed
+// reading and matches UpdatePeer.
+//
+// Unlike applyPeer's config, the string built here carries no key material:
+// a public key is not a secret.
+func (d *tunnelDevice) SetPeerEndpoint(publicKey string, endpoint netip.AddrPort) error {
+	pub, err := keyToHex(publicKey)
+	if err != nil {
+		return fmt.Errorf("gocloak: device: set peer endpoint: public key: %w", err)
+	}
+	if !endpoint.IsValid() || endpoint.Port() == 0 {
+		return fmt.Errorf("gocloak: device: set peer endpoint: %s is not a usable address and port", endpoint)
+	}
+	cfg := fmt.Sprintf("public_key=%s\nupdate_only=true\nendpoint=%s\n", pub, endpoint)
+	if err := d.dev.IpcSet(cfg); err != nil {
+		return fmt.Errorf("gocloak: device: set peer endpoint: %w", err)
+	}
+	return nil
+}
+
 // applyPeer builds and applies one peer's UAPI block. Any error from
 // IpcSet is returned, never logged and swallowed: a peer reported as
 // applied when it was not means a revocation that silently did not happen.
@@ -244,6 +271,8 @@ func (p devicePeer) ipcConfig(updateOnly bool) (string, error) {
 		return "", fmt.Errorf("gocloak: device: peer: allowed IP %s is outside %s", p.AllowedIP, tunnelSubnet)
 	}
 
+	hasEndpoint := p.Endpoint != (netip.AddrPort{})
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "public_key=%s\n", pub)
 	if updateOnly {
@@ -252,7 +281,7 @@ func (p devicePeer) ipcConfig(updateOnly bool) (string, error) {
 		b.WriteString("update_only=true\n")
 	}
 	fmt.Fprintf(&b, "preshared_key=%s\n", psk)
-	if p.Endpoint != (netip.AddrPort{}) {
+	if hasEndpoint {
 		if !p.Endpoint.IsValid() || p.Endpoint.Port() == 0 {
 			return "", fmt.Errorf("gocloak: device: peer: endpoint %s is not a usable address and port", p.Endpoint)
 		}
@@ -264,7 +293,37 @@ func (p devicePeer) ipcConfig(updateOnly bool) (string, error) {
 	// live forever.
 	b.WriteString("replace_allowed_ips=true\n")
 	fmt.Fprintf(&b, "allowed_ip=%s/32\n", p.AllowedIP)
-	fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", keepaliveInterval)
+	if hasEndpoint {
+		// Only with an endpoint, which in this design means only on the
+		// client side. A keepalive is a packet, and a peer with no
+		// endpoint has nowhere to send one: wireguard-go's timer fires
+		// anyway, fails to send, and logs at ERROR roughly every six
+		// seconds for every peer that has not yet spoken. A server with
+		// twenty occasional peers produced a continuous stream of ERROR
+		// lines describing nothing wrong, which trains an operator to
+		// ignore the log this project tells them to read when a
+		// handshake fails.
+		//
+		// Spec section 8.2 is still satisfied. The keepalive exists to
+		// hold a NAT binding open and to notice a dead tunnel quickly,
+		// and both of those belong to the side behind the NAT, which is
+		// the side that knows its peer's address: the client's
+		// keepalive is what holds the binding the server's replies come
+		// back through. Sending one from the server would hold nothing
+		// open that the client is not already holding.
+		//
+		// The server does learn a peer's endpoint from the first valid
+		// packet, and applying the setting then would be legal:
+		// wireguard-go treats persistent_keepalive_interval on an
+		// update_only call to an existing peer as an ordinary update,
+		// and turning it on from zero even sends one keepalive
+		// immediately. It is not done here because nothing tells the
+		// server that the endpoint has been learned. Finding out means
+		// polling IpcGet and parsing every peer's endpoint on a timer,
+		// which is a new background loop for a setting that, per the
+		// paragraph above, buys the server nothing.
+		fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", keepaliveInterval)
+	}
 	return b.String(), nil
 }
 

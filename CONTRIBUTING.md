@@ -141,40 +141,39 @@ from [docs/build-decisions.md](docs/build-decisions.md) and
 [docs/final-review.md](docs/final-review.md), where the reasoning is recorded in
 more detail.
 
-### 1. The idle-peer handshake log storm
+### 1. `deviceLogVerbose` is defined and nothing outside the tests uses it
 
-**The symptom.** A running server logs, at ERROR level, roughly every six
-seconds for every peer that has not yet completed a handshake:
+**What it is.** `device.go` defines three log levels, `deviceLogSilent`,
+`deviceLogError` and `deviceLogVerbose`, as named mirrors of wireguard-go's
+own constants so a caller does not have to import
+`golang.zx2c4.com/wireguard/device` to pick one. The client and the server
+both run at `deviceLogError`. `deviceLogVerbose` is referenced only from
+`device_test.go`, twice.
 
-```
-level=ERROR msg="gocloak: wireguard" message="peer(dT8x...a4Qg) - Failed to send handshake initiation: no known endpoint for peer"
-```
+**Why it is worth closing.** The build's constraint 5 is "prefer deleting code
+over adding a flag", and an identifier that exists only because its neighbours
+do is the mildest possible version of the thing that constraint is about. It
+is recorded as finding M3 in [docs/final-review.md](docs/final-review.md),
+which also makes the argument for the other side: the constant is
+self-documenting next to the two that are used, and deleting it leaves a gap
+in an enumeration. Both readings are defensible, which is why this is a
+contribution and not a bug.
 
-A deployment with twenty peers that connect occasionally produces a continuous
-stream of ERROR lines describing nothing wrong. It trains operators to ignore
-the log, which is precisely the log this project tells them to read when a
-handshake fails.
+**The trap.** The obvious way to make an unused constant used is to add a
+configuration knob that selects the log level, and that is the wrong fix here.
+Every knob is a way to be deployed insecurely, and this particular one turns on
+a log stream from a dependency, in a library whose logging rules are absolute.
+It is not that verbose output leaks key material; it does not, and
+`TestDeviceVerboseLogNeverLeaksKeyMaterial` is there to keep it that way. It is
+that "an identifier is unused" is not an argument for new configuration. If you
+believe the knob is right anyway, open an issue and make that case first.
 
-**The cause.** `devicePeer.ipcConfig` in `device.go` writes
-`persistent_keepalive_interval=25` for every peer unconditionally. That is
-correct for the client, whose peer is the server and whose endpoint is known at
-configuration time. It is wrong for the server, whose peers have no endpoint at
-all until the client speaks first: the keepalive timer fires, wireguard-go tries
-to send, there is no endpoint, and it logs an error.
-
-**The shape of a fix.** The keepalive belongs to the side that knows its peer's
-endpoint. The narrow version is to emit the line only when `p.Endpoint` is set;
-note that the server does learn a peer's endpoint after the first valid packet,
-so consider whether the setting should be applied then, and check what
-wireguard-go does with `persistent_keepalive_interval` on an `update_only`
-call. Spec section 8.2 is the constraint to respect:
-`persistent_keepalive_interval=25` is there to keep NAT bindings alive and to
-detect a dead tunnel quickly, so do not simply delete it from the client path.
-
-**Tests.** `device_test.go` already asserts on the rendered UAPI config;
-add cases covering a peer with an endpoint and a peer without. A server-side
-test asserting that no such ERROR line appears for an idle peer would be
-stronger still.
+**The shape of a fix.** Delete `deviceLogVerbose` and point the two test
+references at `device.LogLevelVerbose` directly, which `device_test.go` already
+imports. `TestDeviceVerboseLogNeverLeaksKeyMaterial` must still run the device
+at the verbose level afterwards, because that test is the reason anyone can be
+relaxed about wireguard-go's logging at all. Fix the comment on
+`deviceOptions.LogLevel`, which lists all three names, in the same commit.
 
 ### 2. `resolveFile` does not require a regular file
 

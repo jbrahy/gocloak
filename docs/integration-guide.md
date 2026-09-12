@@ -228,17 +228,6 @@ unreadable key or a peer whose PSK will not resolve all exit non-zero rather
 than starting degraded, so a supervisor backs off and retries instead of
 running a half-configured tunnel.
 
-You will also see this line, at ERROR level, roughly every six seconds for
-every peer that has not yet spoken:
-
-```
-level=ERROR msg="gocloak: wireguard" message="peer(dT8x...a4Qg) - Failed to send handshake initiation: no known endpoint for peer"
-```
-
-That is a known, tracked defect in idle-peer logging, not a sign anything is
-broken. See the "good first contributions" list in
-[CONTRIBUTING.md](../CONTRIBUTING.md).
-
 ### 4.4 Send something through the tunnel
 
 `gocloak-send` is a real client. Every flag except `--timeout` is required:
@@ -343,7 +332,10 @@ func main() {
 `MTU` and `DialTimeout` may be omitted and default to 1280 and 10 seconds.
 `ServerPubKey` is pinned: it is the only key this client will complete a
 handshake with, and there is no certificate authority and nothing to
-negotiate. `Endpoint` is resolved once, at construction.
+negotiate. `Endpoint` is resolved at construction, and resolved again by a
+`Dial` that cannot bring the tunnel up, so an endpoint that has been
+readdressed is followed without rebuilding the client; see
+[5.5](#55-an-endpoint-that-moves). An IP literal is never looked up.
 
 `NewClient` contacts the secret store, so it can fail. It fails rather than
 returning a half-usable client: there is no path where a client exists with
@@ -381,6 +373,68 @@ resp, err := httpClient.Get("http://internal-api/health")
 
 The URL's host must therefore match the service name charset,
 `^[a-z0-9][a-z0-9-]{0,62}$`. A port in the URL is stripped and ignored.
+
+The scheme must be `http`, never `https`. The tunnel is the encryption, there
+is no TLS inside it, and there is no certificate to verify: a backend is
+reached by a name that only this peer's allow map can resolve.
+
+#### A tunnel backend is a `RoundTripper`, not a base URL
+
+This is the part that surprises people, and it changes the shape of your
+plumbing rather than one line of it. A desktop application putting a WebView
+in front of a private service is a reverse proxy, and a reverse proxy usually
+holds a base URL per backend: `https://api.internal.example.com`. A tunnel
+backend has no URL. The address lives in the server's `peers.yaml`, the client
+cannot express it and never learns it, and all the client has is a name and a
+dialer. So the thing you store per backend is an `http.RoundTripper` plus a
+synthetic URL whose host is the service name:
+
+```go
+// One transport per gocloak.Client. Every service behind that client is
+// reached through it, because DialContext turns the URL's host into the
+// service name.
+tunnel := &http.Transport{
+	DialContext:         client.DialContext,
+	MaxIdleConnsPerHost: 32,
+}
+
+// A backend is a round tripper and a host, not a base URL. Mixing
+// tunnelled and direct backends means mixing round trippers, which is
+// exactly why this is the unit.
+type backend struct {
+	host      string // the gocloak service name for a tunnelled backend
+	transport http.RoundTripper
+}
+
+backends := map[string]backend{
+	"api":  {host: "internal-api", transport: tunnel},
+	"docs": {host: "docs.example.com", transport: http.DefaultTransport},
+}
+
+func proxyFor(b backend) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Transport: b.transport,
+		Rewrite: func(r *httputil.ProxyRequest) {
+			// Synthetic: this URL exists to satisfy net/http. For
+			// the tunnelled backend the host is a service name,
+			// and the transport is what decides where the bytes
+			// go. Nothing resolves it and nothing connects to it.
+			r.Out.URL.Scheme = "http"
+			r.Out.URL.Host = b.host
+			r.SetXForwarded()
+		},
+	}
+}
+
+// The WebView points at this, and never at the tunnel.
+http.Handle("/api/", http.StripPrefix("/api", proxyFor(backends["api"])))
+```
+
+Two things follow that are easy to get wrong. The `Host` header the backend
+sees is the service name unless you set `r.Out.Host` yourself, which matters if
+the backend is a virtual host. And a WebSocket or any other hijacked
+connection works, because what comes back from `Dial` is an ordinary
+`net.Conn`, but only if the same transport is used for it.
 
 ### 5.2 With `database/sql`
 
@@ -420,6 +474,85 @@ duplicate application bytes. The WireGuard device itself may re-handshake at
 any time, which does not affect a connection already handed out.
 
 A `*Client` is safe for concurrent use.
+
+### 5.4 The per-peer limits are an integration concern, not just a config key
+
+This one was found by an integrator, in an application that worked in
+development and returned `ErrRateLimited` the first time a page loaded several
+resources at once. It is worth reading before you ship rather than after.
+
+The defaults in `peers.yaml` are `max_concurrent: 32` and
+`dials_per_second: 10`, and they are per peer, enforced by the server (see
+[7.5](#75-per-peer-limits)). `dials_per_second` is a token bucket on new
+connections, and an `http.Transport` opening a burst **will** hit it: a page
+with a dozen sub-resources, a client that fans out on startup, or a proxy that
+has just been restarted all produce more than ten dials in a second while the
+connection pool is cold. Nothing is wrong when that happens, and neither end is
+misconfigured; the peer simply asked for connections faster than its own
+allowance.
+
+Three things to do about it, in order of how much they help:
+
+- **Raise the caps for an HTTP workload.** The defaults suit a database pool
+  with a handful of long-lived connections, not a browser. A desktop
+  application in front of a WebView wants something more like
+  `max_concurrent: 64` and `dials_per_second: 50`. They are per peer, so
+  raising them for the one peer that needs it costs nothing for the rest, and
+  a reload applies the change without a restart.
+- **Set `MaxIdleConnsPerHost` so connections are reused rather than
+  redialled.** Go's default is 2, which for a tunnel means most requests open a
+  new connection and spend a token that a reused connection would not have
+  spent. Setting it to roughly the concurrency you expect turns a burst of
+  dials into a burst of requests on connections you already hold. Do the same
+  with `db.SetMaxIdleConns` for a database pool.
+- **Treat `ErrRateLimited` as backpressure, not as a fatal error.** It is a
+  normal condition with an obvious response: back off and retry, ideally with
+  jitter. It is a distinct sentinel precisely so an application can tell it
+  apart from `ErrDenied`, which is the one that will never succeed no matter
+  how long you wait. Retrying a denial is pointless; retrying a rate limit is
+  correct.
+
+```go
+conn, err := client.Dial(ctx, "internal-api")
+switch {
+case errors.Is(err, gocloak.ErrRateLimited):
+	// Backpressure. Back off and try again.
+case errors.Is(err, gocloak.ErrDenied):
+	// Policy. Retrying will not help; this needs a peers.yaml edit.
+}
+```
+
+### 5.5 An endpoint that moves
+
+A desktop application sleeps, wakes up on a different network, and drops its
+tunnel several times a day. If the endpoint's DNS record has changed in the
+meantime, and for anything behind a dynamic address it will have, the client
+is holding an address that no longer answers.
+
+You do not have to do anything about that. A `Dial` that cannot bring the
+tunnel up re-resolves the endpoint name once, and if it now names a different
+address it moves the tunnel there and carries on with the dial it was already
+making. A dial that succeeds does no lookup at all, so this costs nothing when
+nothing has moved, and an `Endpoint` configured as an IP literal is never
+looked up in either direction.
+
+What this means for your code: do not write a reconnect wrapper that closes
+the client and builds a new one. A `*Client` is safe for concurrent use, and a
+wrapper that swaps one out from underneath concurrent users has to solve a
+problem the library has already solved. Retrying `Dial` is the whole recovery
+path.
+
+Two edges worth knowing:
+
+- Recovery can take two dials rather than one. The re-resolution happens
+  inside a dial that is already failing, and WireGuard throttles handshake
+  initiations, so if the first dial's budget runs out before the handshake to
+  the new address completes it returns `ErrHandshakeTimeout` and the next one
+  succeeds. Give `DialTimeout` enough room, or just retry.
+- A re-resolution that fails, fails the dial. A name that will not resolve, or
+  that resolves to nothing, ends the call with that error rather than falling
+  back to the address that was already not working. That is the fail-closed
+  direction: an address the client cannot confirm is not one to keep using.
 
 ## 6. The error model
 
@@ -597,6 +730,12 @@ connection open until it is reaped by a reload or the backend closes it, so
 size `max_concurrent` with some headroom above the pool size you actually
 expect.
 
+If the peer is an HTTP workload rather than a database pool, read
+[5.4](#54-the-per-peer-limits-are-an-integration-concern-not-just-a-config-key)
+before you leave these at their defaults. A transport opening a burst of
+connections hits `dials_per_second` first, and it is the limit integrators
+meet in practice.
+
 ### 7.6 Deployment shape
 
 The process opens exactly one port to the internet: the UDP `listen_port`.
@@ -684,8 +823,11 @@ finished starting and the error above it says why.
 
 Check the endpoint the client resolved. When `Endpoint` is a name, the error
 message includes what it resolved to: `no response from tunnel.example.com:51820
-(resolved to 203.0.113.10:51820)`. A stale DNS record sends a perfectly good
-client to a perfectly silent address.
+(resolved to 203.0.113.10:51820)`, and after a failed dial that is the address
+the re-resolution found, not the one construction did. A DNS record that is
+stale everywhere, rather than only in this process, still sends a perfectly
+good client to a perfectly silent address: the client follows the name, so a
+name pointing at the wrong place is a name pointing at the wrong place.
 
 ### A seventh thing that is not on the client's list
 

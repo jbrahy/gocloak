@@ -82,9 +82,12 @@ var (
 // ClientConfig is the client's configuration, per spec section 5.
 type ClientConfig struct {
 	// Endpoint is the server's public UDP address,
-	// "tunnel.example.com:51820". A host name is resolved once, at
-	// construction; see NewClient for what that means for a name with
-	// several addresses and for an address that changes later.
+	// "tunnel.example.com:51820". A host name is resolved at
+	// construction, and resolved again by a Dial that cannot bring the
+	// tunnel up, so an endpoint that moves is followed without the
+	// caller replacing the Client. An IP literal is never looked up. See
+	// NewClient for what that means for a name with several addresses,
+	// and for what it deliberately does not do on the happy path.
 	Endpoint string
 
 	// ServerPubKey is the server's Curve25519 public key, base64
@@ -132,10 +135,20 @@ type ClientConfig struct {
 // A Client is safe for concurrent use. It never re-establishes a connection
 // it has already returned; see Dial.
 type Client struct {
-	// endpointText is how the endpoint is named in an error: the
-	// configured string, plus the address it resolved to when those
-	// differ. An operator debugging a timeout needs both.
-	endpointText string
+	// endpoint is the server's UDP address, plus everything needed to
+	// resolve its name again. See clientEndpoint.
+	endpoint *clientEndpoint
+
+	// serverPubKey identifies the one peer on the device, which is the
+	// peer whose endpoint a re-resolution moves. It is a public key, so
+	// it is not key material this struct has to redact.
+	serverPubKey string
+
+	// names is the name resolution both the constructor and the
+	// re-resolve path use. It is net.DefaultResolver everywhere except
+	// in a test. It is not ClientConfig.Resolver, which resolves secret
+	// references and has nothing to do with DNS.
+	names endpointResolver
 
 	// serverAddr is the in-tunnel control address, 10.99.0.1:443.
 	serverAddr netip.AddrPort
@@ -147,6 +160,82 @@ type Client struct {
 	closed    atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// endpointResolver is the name resolution the client does. It is an
+// interface only so a test can supply one: *net.Resolver implements it, and
+// net.DefaultResolver is the only implementation in a built program.
+type endpointResolver interface {
+	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
+// clientEndpoint is the server's UDP address and the means to find it
+// again. A desktop application sleeps, changes network and loses its tunnel
+// several times a day, and an endpoint whose name has moved in the meantime
+// used to mean the caller had to Close and rebuild the Client. This type is
+// what makes the address a Client holds replaceable in place instead.
+//
+// Everything mutable here is guarded, because a Client is documented as safe
+// for concurrent use and a re-resolution can happen while other goroutines
+// are dialing.
+type clientEndpoint struct {
+	// configured, host and port are how the caller wrote the endpoint,
+	// and never change.
+	configured string
+	host       string
+	port       uint16
+
+	// literal reports that host is an IP address rather than a name. A
+	// literal is never looked up, at construction or afterwards: an
+	// operator who configures an address gets that address.
+	literal bool
+
+	// refreshing is a one-slot semaphore serializing re-resolution, so
+	// several dials failing at once produce one lookup rather than one
+	// each. It is a channel rather than a Mutex because it is acquired
+	// with a select: a dial waiting for someone else's lookup must be
+	// able to give up when its own budget expires, which is what keeps a
+	// re-resolution inside DialTimeout.
+	refreshing chan struct{}
+
+	mu sync.Mutex
+	// addr is the address the device's peer currently points at.
+	addr netip.AddrPort
+	// generation counts completed re-resolutions. A dial records it
+	// before its first attempt, so a dial that then fails can tell
+	// whether someone else has already looked the name up in the
+	// meantime and skip the work.
+	generation uint64
+}
+
+// current returns the address in force and the generation it belongs to.
+func (e *clientEndpoint) current() (netip.AddrPort, uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.addr, e.generation
+}
+
+// applied records the address a completed re-resolution put on the device.
+// The generation advances whether or not the address changed, because it
+// counts lookups, and its purpose is to tell another dial that a lookup it
+// was about to do has just been done.
+func (e *clientEndpoint) applied(addr netip.AddrPort) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.addr = addr
+	e.generation++
+}
+
+// describe is how the endpoint is named in an error: the configured string,
+// plus the address it resolved to when those differ. An operator debugging a
+// timeout needs both, and after a re-resolution needs the address actually
+// in use rather than the one construction found.
+func (e *clientEndpoint) describe() string {
+	if e.literal {
+		return e.configured
+	}
+	addr, _ := e.current()
+	return fmt.Sprintf("%s (resolved to %s)", e.configured, addr)
 }
 
 // NewClient validates cfg, resolves the key material, brings up the
@@ -162,8 +251,8 @@ type Client struct {
 //
 // # Endpoint resolution
 //
-// The endpoint host is resolved exactly once, here, under a bounded
-// context, because the WireGuard bind performs no name resolution.
+// The endpoint host is resolved here, under a bounded context, because the
+// WireGuard bind performs no name resolution.
 //
 // A name with several addresses yields one endpoint: the first address the
 // resolver returns. WireGuard has one endpoint per peer and no failover in
@@ -172,12 +261,27 @@ type Client struct {
 // address a name happens to point at. An operator who needs a specific
 // address should configure an IP literal, which skips resolution entirely.
 //
-// An endpoint whose address changes later is not followed. This client goes
-// on speaking to the address it resolved at construction; recovering means
-// Close and NewClient. Note that the reverse case is handled: a client that
+// An endpoint whose address changes later is followed, but only when
+// something is already wrong: a Dial that cannot bring the tunnel up
+// re-resolves the name once and, if it now names a different address, moves
+// the device peer onto it before giving up. A dial that succeeds does no
+// lookup at all, so the common case costs nothing, and an IP literal is
+// never looked up in either case. A re-resolution that fails, or that
+// returns nothing, fails the dial rather than falling back to an address it
+// could not confirm.
+//
+// Note that the reverse case is handled by the protocol: a client that
 // changes network is WireGuard roaming, and the server relearns the peer's
 // endpoint from its first valid authenticated packet (spec section 8.2).
 func NewClient(cfg ClientConfig) (*Client, error) {
+	return newClient(cfg, net.DefaultResolver)
+}
+
+// newClient is NewClient with the name resolution as a parameter, which is
+// the only thing about a client that a test cannot otherwise arrange: DNS
+// answers are not something a test may depend on. It is unexported and takes
+// no other liberties.
+func newClient(cfg ClientConfig, names endpointResolver) (*Client, error) {
 	host, port, err := splitEndpoint(cfg.Endpoint)
 	if err != nil {
 		return nil, err
@@ -209,7 +313,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		dialTimeout = DefaultDialTimeout
 	}
 
-	endpoint, literal, err := resolveEndpoint(host, port)
+	endpoint, literal, err := resolveEndpoint(context.Background(), names, host, port)
 	if err != nil {
 		return nil, err
 	}
@@ -259,13 +363,17 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, err
 	}
 
-	endpointText := cfg.Endpoint
-	if !literal {
-		endpointText = fmt.Sprintf("%s (resolved to %s)", cfg.Endpoint, endpoint)
-	}
-
 	return &Client{
-		endpointText: endpointText,
+		endpoint: &clientEndpoint{
+			configured: cfg.Endpoint,
+			host:       host,
+			port:       port,
+			literal:    literal,
+			refreshing: make(chan struct{}, 1),
+			addr:       endpoint,
+		},
+		serverPubKey: cfg.ServerPubKey,
+		names:        names,
 		serverAddr:   netip.AddrPortFrom(serverTunnelIP, tunnelServicePort),
 		dialTimeout:  dialTimeout,
 		dev:          dev,
@@ -450,8 +558,17 @@ func (c *Client) Close() error {
 // sooner of DialTimeout and the caller's ctx, so a handshake that never
 // completes fails rather than hangs. ctx is the caller's own, used only to
 // tell a cancellation apart from an expiry.
+//
+// A dial that has failed an attempt is also where the endpoint is
+// re-resolved, once, before the remaining attempts: see refreshEndpoint for
+// why here and nowhere else.
 func (c *Client) dialControl(ctx, budget context.Context) (net.Conn, error) {
 	start := time.Now()
+
+	// Recorded before the first attempt, so that if this dial ends up
+	// re-resolving it can tell whether another dial has already done it.
+	_, generation := c.endpoint.current()
+	refreshed := false
 
 	for {
 		attemptCtx, attemptCancel := context.WithTimeout(budget, clientDialAttemptTimeout)
@@ -466,12 +583,78 @@ func (c *Client) dialControl(ctx, budget context.Context) (net.Conn, error) {
 			// A caller who cancelled gets their own error back:
 			// nothing timed out, they changed their mind.
 			if errors.Is(ctx.Err(), context.Canceled) {
-				return nil, fmt.Errorf("gocloak: client: dial %s: %w", c.endpointText, ctx.Err())
+				return nil, fmt.Errorf("gocloak: client: dial %s: %w", c.endpoint.describe(), ctx.Err())
 			}
 			return nil, c.handshakeTimeoutError(handshakeBound(budget, start))
 		case <-time.After(clientDialRetryInterval):
 		}
+
+		if !refreshed {
+			refreshed = true
+			// Fail closed: a name that will not resolve ends the
+			// dial. Carrying on against the address that is
+			// already failing would be using an address this
+			// client can no longer confirm.
+			if err := c.refreshEndpoint(budget, generation); err != nil {
+				return nil, err
+			}
+		}
 	}
+}
+
+// refreshEndpoint re-resolves the endpoint host and, when the name now
+// yields a different address, moves the device peer onto it so the attempts
+// that follow reach the new one.
+//
+// It runs only after a dial attempt has failed, and at most once per dial.
+// On the happy path the tunnel is already up, the first attempt succeeds and
+// no lookup happens: adding one to every dial would spend a DNS round trip
+// on every connection to learn something that has not changed. A failed
+// attempt is the signal that it may have.
+//
+// An IP literal returns immediately, with no lookup ever, which is what an
+// operator who configured an address rather than a name asked for.
+//
+// Concurrency. Several goroutines dialing the same Client will fail
+// together, decide to re-resolve together, and must not all look the name up
+// and race each other onto the device. One of them does the work; the rest
+// wait for the semaphore, see the generation has advanced, and use what it
+// found. A waiter whose own budget expires first stops waiting, because a
+// re-resolution may not push a Dial past its DialTimeout.
+func (c *Client) refreshEndpoint(budget context.Context, generation uint64) error {
+	if c.endpoint.literal {
+		return nil
+	}
+
+	select {
+	case c.endpoint.refreshing <- struct{}{}:
+	case <-budget.Done():
+		// Out of budget waiting for someone else's lookup. Not an
+		// error of its own: the loop above is about to end this dial
+		// with the message spec section 8.1 fixes, which is the
+		// correct report of a tunnel that never came up.
+		return nil
+	}
+	defer func() { <-c.endpoint.refreshing }()
+
+	if _, now := c.endpoint.current(); now != generation {
+		// Another dial resolved the name after this one started. Its
+		// answer is at most a few hundred milliseconds old, and a
+		// second lookup would say the same thing.
+		return nil
+	}
+
+	addr, _, err := resolveEndpoint(budget, c.names, c.endpoint.host, c.endpoint.port)
+	if err != nil {
+		return err
+	}
+	if current, _ := c.endpoint.current(); addr != current {
+		if err := c.dev.SetPeerEndpoint(c.serverPubKey, addr); err != nil {
+			return err
+		}
+	}
+	c.endpoint.applied(addr)
+	return nil
 }
 
 // handshakeBound is how long the client was prepared to wait: the budget's
@@ -508,7 +691,7 @@ func (c *Client) handshakeTimeoutError(waited time.Duration) error {
 		"wrong server public key, wrong client key, revoked peer, wrong PSK, "+
 		"UDP blocked on this network, or the endpoint is down. "+
 		"The server cannot tell you which. Check the server log for a peer entry",
-		ErrHandshakeTimeout, c.endpointText, waited)
+		ErrHandshakeTimeout, c.endpoint.describe(), waited)
 }
 
 // helloError wraps a failure during the hello exchange. A cancelled or
@@ -517,9 +700,9 @@ func (c *Client) handshakeTimeoutError(waited time.Duration) error {
 // otherwise be reported as the server's fault.
 func (c *Client) helloError(ctx context.Context, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return fmt.Errorf("gocloak: client: hello exchange with %s: %w", c.endpointText, ctxErr)
+		return fmt.Errorf("gocloak: client: hello exchange with %s: %w", c.endpoint.describe(), ctxErr)
 	}
-	return fmt.Errorf("gocloak: client: hello exchange with %s: %w", c.endpointText, err)
+	return fmt.Errorf("gocloak: client: hello exchange with %s: %w", c.endpoint.describe(), err)
 }
 
 // statusError maps a hello response status to its sentinel. statusOK is the
@@ -581,17 +764,21 @@ func splitEndpoint(endpoint string) (host string, port uint16, err error) {
 // resolveEndpoint turns a host and port into the AddrPort the WireGuard
 // bind needs, and reports whether the host was already an IP literal.
 //
+// The lookup is bounded by clientEndpointResolveTimeout or by ctx, whichever
+// expires first, so the re-resolve path inherits the dial's budget and a
+// re-resolution cannot push a Dial past its DialTimeout.
+//
 // See NewClient for what happens with several addresses and with an address
 // that changes later.
-func resolveEndpoint(host string, port uint16) (addr netip.AddrPort, literal bool, err error) {
+func resolveEndpoint(ctx context.Context, r endpointResolver, host string, port uint16) (addr netip.AddrPort, literal bool, err error) {
 	if ip, perr := netip.ParseAddr(host); perr == nil {
 		return netip.AddrPortFrom(ip.Unmap(), port), true, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), clientEndpointResolveTimeout)
+	ctx, cancel := context.WithTimeout(ctx, clientEndpointResolveTimeout)
 	defer cancel()
 
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	ips, err := r.LookupNetIP(ctx, "ip", host)
 	if err != nil {
 		return netip.AddrPort{}, false, fmt.Errorf("gocloak: client: resolve endpoint %q: %w", host, err)
 	}

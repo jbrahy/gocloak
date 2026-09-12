@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -329,6 +330,97 @@ func TestSecretStringRedacted(t *testing.T) {
 		}
 		if strings.Contains(tc.repr, "top-secret-value") {
 			t.Fatalf("%s leaked the resolved value: %q", tc.name, tc.repr)
+		}
+	}
+}
+
+// TestSecretErrorsNeverEchoTheReference is the regression test for the leak
+// that shipped in v0.1.0: parseSecretRef answered a reference with no scheme
+// with `secret: reference %q has no scheme`, so a literal 32-byte key pasted
+// where a SecretRef belongs came back, verbatim and in full, inside an error
+// that a caller logs. The YAML path was already guarded by validSecretRef;
+// the programmatic path, which is what a library consumer builds a
+// ClientConfig on, was not.
+//
+// The rule the test pins: no error from parsing or resolving a reference may
+// contain the text it was given. A reference with no scheme is precisely the
+// case where that text is most likely to be a key.
+//
+// It checks every 10-character window of the input rather than the whole
+// string, so a partial echo (a truncated key, a quoted prefix, a scheme that
+// is really the head of a pasted secret) fails it too. Ten is the smallest
+// window that still permits the one fragment an error here is allowed to
+// carry, a scheme that has passed validSchemeName plus its colon: the
+// longest this project defines, "aws:ssm:", is eight characters. Anything
+// larger echoed from a reference fails the test.
+func TestSecretErrorsNeverEchoTheReference(t *testing.T) {
+	// Secret-shaped inputs: what an operator actually pastes when they get
+	// this wrong. The first is the exact value that reproduced the v0.1.0
+	// leak.
+	inputs := []SecretRef{
+		"jLTRL6w9l++zTSr+i3m6w61Eep/UvCa9cVtyxEKdIlg=",
+		"8f40a1c7b25e93d06a4f18cc7b2e5d3491ab6720ff8c1d5e9a03b47c62d8e105",
+		"AKIAIOSFODNN7EXAMPLE",
+		"hunter2:correct-horse-battery-staple",
+		"Aws:sm:gocloak/server/private",
+		"3q2+7wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:",
+	}
+
+	// Both resolvers, because delegation is a second path to an error: one
+	// with no SecretResolver at all and one with a resolver that refuses
+	// everything, the way a real store does for a reference it cannot find.
+	bare := &secretResolver{}
+	delegating := &secretResolver{external: &fakeResolver{err: errors.New("access denied")}}
+
+	for _, ref := range inputs {
+		t.Run(string(ref[:min(len(ref), 12)]), func(t *testing.T) {
+			var errs []error
+
+			if _, _, err := parseSecretRef(ref); err != nil {
+				errs = append(errs, err)
+			}
+			if _, err := bare.Resolve(context.Background(), ref); err != nil {
+				errs = append(errs, err)
+			}
+			if _, err := delegating.Resolve(context.Background(), ref); err != nil {
+				errs = append(errs, err)
+			}
+			if err := validSecretRef(ref); err != nil {
+				errs = append(errs, err)
+			}
+			// The live path a library consumer is on: a ClientConfig
+			// built in Go with a literal key in a SecretRef field.
+			if _, err := NewClient(ClientConfig{
+				Endpoint:     "198.51.100.1:51820",
+				ServerPubKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+				PrivateKey:   ref,
+				PresharedKey: ref,
+				TunnelIP:     netip.MustParseAddr("10.99.0.7"),
+			}); err != nil {
+				errs = append(errs, err)
+			}
+
+			if len(errs) == 0 {
+				t.Fatalf("no error for %q, so this case proves nothing", string(ref))
+			}
+			for _, err := range errs {
+				assertNoFragmentOf(t, err.Error(), string(ref))
+			}
+		})
+	}
+}
+
+// assertNoFragmentOf fails the test if any 10-character window of the
+// reference appears in msg.
+func assertNoFragmentOf(t *testing.T, msg, secretText string) {
+	t.Helper()
+	const window = 10
+	if strings.Contains(msg, secretText) {
+		t.Fatalf("error echoes the whole reference:\n  error: %s\n  reference: %s", msg, secretText)
+	}
+	for i := 0; i+window <= len(secretText); i++ {
+		if fragment := secretText[i : i+window]; strings.Contains(msg, fragment) {
+			t.Fatalf("error echoes %q, a fragment of the reference:\n  error: %s", fragment, msg)
 		}
 	}
 }

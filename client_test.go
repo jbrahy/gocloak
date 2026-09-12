@@ -106,6 +106,21 @@ func (h *clientTestHarness) client(tweak ...func(*ClientConfig)) *Client {
 	return c
 }
 
+// clientTestLiteralEndpoint builds the endpoint state for a Client that a
+// test constructs directly, from an IP literal, which is the form that needs
+// no resolver and no lookup.
+func clientTestLiteralEndpoint(addr string) *clientEndpoint {
+	ap := netip.MustParseAddrPort(addr)
+	return &clientEndpoint{
+		configured: addr,
+		host:       ap.Addr().String(),
+		port:       ap.Port(),
+		literal:    true,
+		refreshing: make(chan struct{}, 1),
+		addr:       ap,
+	}
+}
+
 // clientTestCtx is a context bounded so no test in this file can hang.
 func clientTestCtx(t *testing.T, d time.Duration) context.Context {
 	t.Helper()
@@ -396,8 +411,14 @@ func TestClientWrongKeyAndWrongPSKAreIndistinguishable(t *testing.T) {
 // actually theirs.
 func TestClientHandshakeTimeoutNamesEveryCause(t *testing.T) {
 	c := &Client{
-		endpointText: "tunnel.example.com:51820",
-		dialTimeout:  10 * time.Second,
+		endpoint: &clientEndpoint{
+			configured: "tunnel.example.com:51820",
+			host:       "tunnel.example.com",
+			port:       51820,
+			addr:       netip.MustParseAddrPort("203.0.113.10:51820"),
+			refreshing: make(chan struct{}, 1),
+		},
+		dialTimeout: 10 * time.Second,
 	}
 	err := c.handshakeTimeoutError(10 * time.Second)
 
@@ -688,7 +709,7 @@ func TestClientHelloIsBoundedByTheDialBudget(t *testing.T) {
 
 	// The deadline for one step of the exchange is the sooner of the
 	// spec's value and what is left of the budget.
-	c := &Client{endpointText: "127.0.0.1:51820", dialTimeout: budget}
+	c := &Client{endpoint: clientTestLiteralEndpoint("127.0.0.1:51820"), dialTimeout: budget}
 
 	tight, cancelTight := context.WithTimeout(context.Background(), budget)
 	defer cancelTight()
@@ -737,7 +758,7 @@ func TestClientHelloIsBoundedByTheDialBudget(t *testing.T) {
 // be a fully established, hello-completed conn that dies underneath the
 // application with no error at all.
 func TestClientFinishHelloRefusesAConnTheWatchdogIsClosing(t *testing.T) {
-	c := &Client{endpointText: "127.0.0.1:51820", dialTimeout: time.Second}
+	c := &Client{endpoint: clientTestLiteralEndpoint("127.0.0.1:51820"), dialTimeout: time.Second}
 
 	local, remote := net.Pipe()
 	defer local.Close()
@@ -1109,5 +1130,308 @@ func TestClientNonNativeSchemeWithNoResolverFailsClosed(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "gocloak/app/private") {
 		t.Errorf("error echoes the reference payload: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// endpoint re-resolution
+//
+// The addresses below matter. 192.0.2.1 is TEST-NET-1 (RFC 5737), reserved
+// for documentation, and nothing answers there. A 127.0.0.0/8 address would
+// not do: the test server's UDP socket is bound to the wildcard address, so
+// every loopback address reaches it and a "dead" endpoint on 127.0.0.2 would
+// silently be the live server, leaving these tests asserting nothing.
+// ---------------------------------------------------------------------------
+
+// clientTestDeadAddr is an address nothing answers on. See above.
+var clientTestDeadAddr = netip.MustParseAddr("192.0.2.1")
+
+// clientTestNames is a stand-in for net.DefaultResolver, because a test may
+// not depend on what DNS says. answer is called with the 1-based number of
+// the lookup, so a test can make a name move between dials.
+type clientTestNames struct {
+	answer func(call int) ([]netip.Addr, error)
+
+	mu          sync.Mutex
+	calls       int
+	inFlight    int
+	maxInFlight int
+}
+
+func (r *clientTestNames) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	r.mu.Lock()
+	r.calls++
+	call := r.calls
+	r.inFlight++
+	if r.inFlight > r.maxInFlight {
+		r.maxInFlight = r.inFlight
+	}
+	r.mu.Unlock()
+
+	defer func() {
+		r.mu.Lock()
+		r.inFlight--
+		r.mu.Unlock()
+	}()
+	return r.answer(call)
+}
+
+// count is how many lookups have been made, and peak the most that were ever
+// in flight at once.
+func (r *clientTestNames) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+func (r *clientTestNames) peak() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maxInFlight
+}
+
+// clientTestMovedName builds a resolver whose name answers with a dead
+// address the first time and the real server afterwards, which is what a
+// laptop sees after it wakes up on a different network and the endpoint has
+// been readdressed in the meantime.
+func clientTestMovedName(delay time.Duration) *clientTestNames {
+	return &clientTestNames{answer: func(call int) ([]netip.Addr, error) {
+		time.Sleep(delay)
+		if call == 1 {
+			return []netip.Addr{clientTestDeadAddr}, nil
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}}
+}
+
+// TestClientReresolvesAMovedEndpoint is the property FIX 3 exists for: a
+// Client whose endpoint name now resolves somewhere else recovers without
+// the caller destroying and rebuilding it, and without the caller having to
+// notice that anything changed.
+//
+// The client is built against a name that resolves to a dead address, so the
+// first dial cannot complete a handshake. It must re-resolve, find the
+// server's real address, move its peer there and come up, all inside the one
+// Dial the application already made.
+func TestClientReresolvesAMovedEndpoint(t *testing.T) {
+	backend := serverTestNewBackend(t, serverTestEcho)
+	h := clientTestStart(t, map[string]string{"echo": backend.String()})
+
+	names := clientTestMovedName(0)
+	cfg := h.cfg
+	cfg.Endpoint = fmt.Sprintf("gocloak.invalid:%d", h.srv.udpPort)
+
+	c, err := newClient(cfg, names)
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	defer c.Close()
+
+	if addr, _ := c.endpoint.current(); addr.Addr() != clientTestDeadAddr {
+		t.Fatalf("client started at %s, want the dead address %s; the test would prove nothing", addr, clientTestDeadAddr)
+	}
+
+	ctx := clientTestCtx(t, clientTestDialBudget+15*time.Second)
+	conn, err := c.Dial(ctx, "echo")
+	if err != nil {
+		t.Fatalf("Dial did not recover from a moved endpoint: %v", err)
+	}
+	defer conn.Close()
+
+	// The tunnel is real, not just established: bytes have to cross it.
+	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "ping" {
+		t.Fatalf("read %q through the recovered tunnel, want %q", got, "ping")
+	}
+
+	if n := names.count(); n < 2 {
+		t.Errorf("the name was looked up %d times, want at least 2: construction and a re-resolution", n)
+	}
+	if addr, _ := c.endpoint.current(); addr.Addr() != netip.MustParseAddr("127.0.0.1") {
+		t.Errorf("endpoint in force is %s, want the address the name moved to", addr)
+	}
+	if !strings.Contains(c.endpoint.describe(), "127.0.0.1") {
+		t.Errorf("an error would still name the old address: %s", c.endpoint.describe())
+	}
+}
+
+// TestClientIPLiteralEndpointIsNeverLookedUp holds the other half of the
+// deal. An operator who configures an address rather than a name gets that
+// address, and no DNS is involved at any point, including the path that
+// re-resolves a name after a failed dial.
+func TestClientIPLiteralEndpointIsNeverLookedUp(t *testing.T) {
+	refuse := &clientTestNames{answer: func(int) ([]netip.Addr, error) {
+		return nil, errors.New("an IP literal endpoint must never be looked up")
+	}}
+
+	backend := serverTestNewBackend(t, serverTestEcho)
+	h := clientTestStart(t, map[string]string{"echo": backend.String()})
+
+	// A dial that succeeds: the happy path must not spend a lookup.
+	c, err := newClient(h.cfg, refuse)
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	defer c.Close()
+
+	conn, err := c.Dial(clientTestCtx(t, clientTestDialBudget+10*time.Second), "echo")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	conn.Close()
+
+	// A dial that fails, which is the path that re-resolves a name. A
+	// literal must still not be looked up, and the failure must be the
+	// one spec section 8.1 fixes rather than a resolver error.
+	dead := h.cfg
+	dead.Endpoint = clientTestDeadAddr.String() + ":51820"
+	dead.DialTimeout = clientTestFailBudget
+
+	d, err := newClient(dead, refuse)
+	if err != nil {
+		t.Fatalf("newClient with a literal endpoint: %v", err)
+	}
+	defer d.Close()
+
+	if _, err := d.Dial(clientTestCtx(t, clientTestFailBudget+10*time.Second), "echo"); !errors.Is(err, ErrHandshakeTimeout) {
+		t.Fatalf("Dial to a dead literal endpoint returned %v, want ErrHandshakeTimeout", err)
+	}
+	if n := refuse.count(); n != 0 {
+		t.Fatalf("the resolver was called %d times for IP literal endpoints, want 0", n)
+	}
+}
+
+// TestClientEndpointReresolutionFailureFailsTheDial is the fail-closed half
+// of FIX 3. A re-resolution that cannot produce an address it can confirm
+// ends the dial. It does not fall back to the address that is already
+// failing, and it does not quietly wait out the rest of the budget.
+func TestClientEndpointReresolutionFailureFailsTheDial(t *testing.T) {
+	backend := serverTestNewBackend(t, serverTestEcho)
+	h := clientTestStart(t, map[string]string{"echo": backend.String()})
+
+	cases := []struct {
+		name    string
+		again   func() ([]netip.Addr, error)
+		wantMsg string
+	}{
+		{
+			name:    "lookup fails",
+			again:   func() ([]netip.Addr, error) { return nil, errors.New("no such host") },
+			wantMsg: "resolve endpoint",
+		},
+		// A resolver that answers with nothing is not a reason to
+		// improvise: it denies like any other failure.
+		{
+			name:    "lookup returns no addresses",
+			again:   func() ([]netip.Addr, error) { return nil, nil },
+			wantMsg: "resolved to no addresses",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			names := &clientTestNames{answer: func(call int) ([]netip.Addr, error) {
+				if call == 1 {
+					return []netip.Addr{clientTestDeadAddr}, nil
+				}
+				return tc.again()
+			}}
+
+			cfg := h.cfg
+			cfg.Endpoint = fmt.Sprintf("gocloak.invalid:%d", h.srv.udpPort)
+			cfg.DialTimeout = 20 * time.Second
+
+			c, err := newClient(cfg, names)
+			if err != nil {
+				t.Fatalf("newClient: %v", err)
+			}
+			defer c.Close()
+
+			start := time.Now()
+			conn, err := c.Dial(clientTestCtx(t, 40*time.Second), "echo")
+			elapsed := time.Since(start)
+			if err == nil {
+				conn.Close()
+				t.Fatal("Dial succeeded with an endpoint that could not be resolved")
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("Dial returned %v, want the re-resolution failure naming %q", err, tc.wantMsg)
+			}
+			if errors.Is(err, ErrHandshakeTimeout) {
+				t.Fatal("a re-resolution failure must end the dial, not wait out the budget as a handshake timeout")
+			}
+			if elapsed > 10*time.Second {
+				t.Fatalf("Dial took %s to report a resolution failure on a 20s budget, which means it waited rather than failed", elapsed)
+			}
+			if addr, _ := c.endpoint.current(); addr.Addr() != clientTestDeadAddr {
+				t.Fatalf("endpoint in force is %s after a failed re-resolution, want the previous address left alone", addr)
+			}
+		})
+	}
+}
+
+// TestClientConcurrentDialsReresolveOnce covers the case a desktop
+// application actually produces: the tunnel dies, every in-flight request
+// fails at once, and every one of them decides to re-resolve. They must not
+// race each other onto the device or storm the resolver. One lookup happens
+// and the rest of the dials use its answer.
+//
+// The deliberate delay inside the resolver is what makes the assertion mean
+// something: if the work were not serialized, overlapping lookups would be
+// observable rather than merely possible.
+func TestClientConcurrentDialsReresolveOnce(t *testing.T) {
+	backend := serverTestNewBackend(t, serverTestEcho)
+	h := clientTestStart(t, map[string]string{"echo": backend.String()}, func(p *serverTestPeer) {
+		p.Limits.MaxConcurrent = 64
+		p.Limits.DialsPerSecond = 200
+	})
+
+	names := clientTestMovedName(100 * time.Millisecond)
+	cfg := h.cfg
+	cfg.Endpoint = fmt.Sprintf("gocloak.invalid:%d", h.srv.udpPort)
+
+	c, err := newClient(cfg, names)
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	defer c.Close()
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), clientTestDialBudget+15*time.Second)
+			defer cancel()
+			conn, err := c.Dial(ctx, "echo")
+			if err != nil {
+				errs <- err
+				return
+			}
+			conn.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent Dial through a moved endpoint failed: %v", err)
+	}
+
+	if peak := names.peak(); peak != 1 {
+		t.Errorf("%d lookups were in flight at once, want 1: re-resolution must be serialized", peak)
+	}
+	if got := names.count(); got < 2 {
+		t.Errorf("the name was looked up %d times, want at least 2: construction and one re-resolution", got)
 	}
 }

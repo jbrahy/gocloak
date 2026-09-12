@@ -81,6 +81,16 @@ translating goCloak's idea of a peer into wireguard-go's UAPI text. Shared by
 the client and the server: `newTunnelDevice`, `AddPeer`, `UpdatePeer`,
 `RemovePeer`, `Close`.
 
+`persistent_keepalive_interval=25` is written only for a peer that has an
+endpoint, which in this design means only on the client side. A peer with no
+endpoint has nowhere to send a keepalive, and wireguard-go logs an ERROR every
+few seconds when its timer fires against one. Spec section 8.2 still holds:
+the keepalive is there to keep a NAT binding open and to notice a dead tunnel,
+and both belong to the side behind the NAT, which is the side that knows its
+peer's address. `SetPeerEndpoint` moves an existing peer's endpoint and
+nothing else, with `update_only`, and is what the client's endpoint
+re-resolution applies.
+
 `keyToHex` is the chokepoint for every key that reaches the UAPI. It base64
 decodes, requires exactly 32 bytes and hex encodes, and its errors never echo
 the key. That matters because wireguard-go's own `IpcSetOperation` logs errors
@@ -172,6 +182,16 @@ Owns `NewClient`, `Dial`, `DialContext`, `Close`, and the seven `Err*`
 sentinels. Also owns the one message the project is most careful about:
 `handshakeTimeoutError`, which must be byte for byte identical whatever the
 cause was.
+
+It also owns the endpoint's mutable half. `clientEndpoint` holds the
+configured string, the host and port, whether the host was an IP literal, the
+address currently on the device, and a generation counter. `refreshEndpoint`
+re-resolves after a failed dial attempt, serialized by a one-slot channel
+taken with a `select` so a waiting dial can give up on its own budget rather
+than the holder's, and skipped entirely when the generation shows another dial
+has just looked the name up. `newClient` takes the resolver as a parameter so
+a test can supply one; `NewClient` passes `net.DefaultResolver` and is the
+only caller that does.
 
 Must not know: anything about backends. The client cannot express an address
 and must never gain the ability to.
@@ -275,7 +295,11 @@ Client side, for the same connection:
 the network), builds one budget with `context.WithTimeout` for the whole call,
 and calls `dialControl`, which retries an in-tunnel TCP dial to `10.99.0.1:443`
 every 250ms until the WireGuard handshake completes. That retry loop is what
-makes `Dial` block on the handshake. On expiry it returns
+makes `Dial` block on the handshake. After its first failed attempt, and at
+most once per dial, it calls `refreshEndpoint`, which re-resolves a name
+endpoint and moves the device peer if the name now yields a different address;
+a failure there ends the dial rather than continuing against an address the
+client cannot confirm. On expiry it returns
 `handshakeTimeoutError(handshakeBound(budget, start))`. On success `hello`
 writes the request, reads the status, maps it through `statusError`, and
 `finishHello` clears the deadlines. `finishHello` checks the result of the
@@ -449,10 +473,15 @@ tree at the time of writing. The ones to read first when you change something:
 - `config_test.go`: unknown keys rejected, a malformed hot reload leaving the
   previous config in force, the debounce, rename replacement, and the YAML
   error sanitization that keeps a document key out of a message.
+- `client_test.go`: the `ErrHandshakeTimeout` text cause by cause, a moved
+  endpoint recovering inside one `Dial`, an IP literal never looked up, a
+  failed re-resolution failing the dial, and concurrent dials sharing one
+  lookup.
 - `secret_test.go`: unknown scheme rejected, `file:` with permissions looser
   than 0600 rejected, an `aws:` reference with no `Resolver` rejected with an
   error that names what to import, a supplied `Resolver` delegated to, and
-  `file:`/`env:` never reaching a `Resolver`.
+  `file:`/`env:` never reaching a `Resolver`, and no error from any parse or
+  resolve path echoing a fragment of the reference it was given.
 - `awssecrets/` (nested module, run its tests from that directory):
   `aws:sm:` and `aws:ssm:` against fake AWS clients, `WithDecryption` asserted,
   and an end-to-end test that wires the resolver into a `gocloak.ClientConfig`.
@@ -537,7 +566,12 @@ a design decision behind it.
       unauthenticated party sent, it is wrong regardless of how convenient it is.
 - [ ] **Names are never resolved.** No DNS anywhere: not in the tunnel, not for
       a backend address, not for a peer. `validatePeer` rejects a hostname at
-      load time. This is what removes DNS rebinding from the design.
+      load time. This is what removes DNS rebinding from the design. The one
+      name anything resolves is `ClientConfig.Endpoint`, on the client, at
+      construction and on a dial that failed to bring the tunnel up. That name
+      addresses the WireGuard endpoint and nothing else: what comes back is
+      pinned by `ServerPubKey` before a single byte is trusted, so a hostile
+      answer buys an attacker nothing but a silent tunnel.
 - [ ] **No X.509, no TLS, no certificate parsing** anywhere in the process.
 - [ ] **Fail closed on every partial failure.** An unreachable secret store, a
       malformed config, a peer that will not apply: exit non-zero rather than

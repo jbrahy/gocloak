@@ -482,6 +482,131 @@ func TestDeviceUpdatePeerDoesNotCreate(t *testing.T) {
 	}
 }
 
+// TestDeviceIpcConfigKeepaliveOnlyWithAnEndpoint pins the fix for the idle
+// peer log storm. persistent_keepalive_interval used to be written for every
+// peer unconditionally. That is right for the client, whose one peer is the
+// server and whose endpoint is known when the peer is configured, and wrong
+// for the server, whose peers have no endpoint until the client speaks
+// first: the keepalive timer fires, wireguard-go has nowhere to send, and it
+// logs at ERROR roughly every six seconds for every idle peer.
+//
+// Both halves are asserted together, because only the pair is the property.
+// Dropping the setting everywhere would also pass a test that checked the
+// server side alone, and that would break spec section 8.2, which is why the
+// client half is here.
+func TestDeviceIpcConfigKeepaliveOnlyWithAnEndpoint(t *testing.T) {
+	_, pub := deviceTestKeypair(t)
+	psk := deviceTestPSK(t)
+	base := devicePeer{PublicKey: pub, PresharedKey: psk, AllowedIP: deviceTestClientIP}
+
+	const keepalive = "persistent_keepalive_interval="
+
+	// The server's view of a peer: no endpoint, because the server learns
+	// one from the first valid authenticated packet.
+	serverSide := base
+	cfg, err := serverSide.ipcConfig(false)
+	if err != nil {
+		t.Fatalf("ipcConfig for a peer with no endpoint: %v", err)
+	}
+	if strings.Contains(cfg, keepalive) {
+		t.Error("a peer with no endpoint must not set a persistent keepalive: the timer fires, there is nowhere to send, and wireguard-go logs an ERROR every few seconds")
+	}
+
+	// The same peer as a live reload applies it, through update_only.
+	cfg, err = serverSide.ipcConfig(true)
+	if err != nil {
+		t.Fatalf("ipcConfig(update_only) for a peer with no endpoint: %v", err)
+	}
+	if strings.Contains(cfg, keepalive) {
+		t.Error("a peer with no endpoint must not set a persistent keepalive on an update either")
+	}
+
+	// The client's view of its one peer: the server, at a known endpoint.
+	clientSide := base
+	clientSide.Endpoint = netip.MustParseAddrPort("198.51.100.7:51820")
+	cfg, err = clientSide.ipcConfig(false)
+	if err != nil {
+		t.Fatalf("ipcConfig for a peer with an endpoint: %v", err)
+	}
+	want := fmt.Sprintf("%s%d\n", keepalive, keepaliveInterval)
+	if !strings.Contains(cfg, want) {
+		t.Errorf("a peer with an endpoint must set %q: spec section 8.2 needs it to hold the NAT binding open and to detect a dead tunnel", want)
+	}
+}
+
+// TestDeviceSetPeerEndpoint covers the device half of the client's endpoint
+// re-resolution: an existing peer's endpoint moves, and a public key that
+// holds no peer moves nothing into existence.
+func TestDeviceSetPeerEndpoint(t *testing.T) {
+	priv, _ := deviceTestKeypair(t)
+	d, err := newTunnelDevice(deviceOptions{TunnelIP: deviceTestClientIP, PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("newTunnelDevice: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	_, peerPub := deviceTestKeypair(t)
+	peerHex, err := keyToHex(peerPub)
+	if err != nil {
+		t.Fatalf("keyToHex: %v", err)
+	}
+
+	// Fail closed first: no peer holds this key, so nothing may be created.
+	if err := d.SetPeerEndpoint(peerPub, netip.MustParseAddrPort("198.51.100.7:51820")); err != nil {
+		t.Fatalf("SetPeerEndpoint on an absent peer: %v", err)
+	}
+	if devicePeerPresent(t, d, peerHex) {
+		t.Fatal("SetPeerEndpoint created a peer that did not exist")
+	}
+
+	if err := d.AddPeer(devicePeer{
+		PublicKey:    peerPub,
+		PresharedKey: deviceTestPSK(t),
+		AllowedIP:    deviceTestServerIP,
+		Endpoint:     netip.MustParseAddrPort("198.51.100.7:51820"),
+	}); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+
+	const moved = "203.0.113.9:51820"
+	if err := d.SetPeerEndpoint(peerPub, netip.MustParseAddrPort(moved)); err != nil {
+		t.Fatalf("SetPeerEndpoint: %v", err)
+	}
+	if got := devicePeerEndpoint(t, d, peerHex); got != moved {
+		t.Fatalf("peer endpoint is %q, want %q", got, moved)
+	}
+
+	// The move must not have disturbed anything else about the peer.
+	if !devicePeerPresent(t, d, peerHex) {
+		t.Fatal("SetPeerEndpoint removed the peer")
+	}
+	if err := d.SetPeerEndpoint(peerPub, netip.AddrPort{}); err == nil {
+		t.Fatal("SetPeerEndpoint accepted an invalid endpoint")
+	}
+}
+
+// devicePeerEndpoint returns the endpoint the device holds for a peer, or
+// "" if it holds none. Like devicePeerPresent it reads the UAPI dump, which
+// carries key material, so the dump itself is never printed or returned.
+func devicePeerEndpoint(t *testing.T, d *tunnelDevice, pubHex string) string {
+	t.Helper()
+	dump, err := d.dev.IpcGet()
+	if err != nil {
+		t.Fatalf("IpcGet: %v", err)
+	}
+	inPeer := false
+	endpoint := ""
+	for _, line := range strings.Split(dump, "\n") {
+		switch {
+		case strings.HasPrefix(line, "public_key="):
+			inPeer = line == "public_key="+pubHex
+		case inPeer && strings.HasPrefix(line, "endpoint="):
+			endpoint = strings.TrimPrefix(line, "endpoint=")
+		}
+	}
+	return endpoint
+}
+
 // devicePeerPresent reports whether the device holds a peer with the given
 // hex public key. It reads the UAPI dump, which also contains the private
 // key and PSKs, so the dump itself is never printed or returned.
