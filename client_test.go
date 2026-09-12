@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -999,5 +1000,45 @@ func clientTestAssertNoSecrets(t *testing.T, text, priv, psk string) {
 		if len(secret) >= 12 && strings.Contains(text, secret[:12]) {
 			t.Errorf("text carries a prefix of key material: %s", text)
 		}
+	}
+}
+
+// TestClientConcurrentDialsAreSafe pins that one Client survives many
+// goroutines dialing at once, which is exactly what http.Transport does when
+// a transport is reused across concurrent requests. The library documents
+// DialContext for that use, so the property needs a test.
+//
+// Note the raised limits: the per-peer dials_per_second cap is what a burst
+// hits first, not any client-side constraint.// exactly what http.Transport does when it reuses a transport across
+// concurrent requests?
+func TestClientConcurrentDialsAreSafe(t *testing.T) {
+	backend := serverTestNewBackend(t, serverTestEcho)
+	h := clientTestStart(t, map[string]string{"svc": backend.String()}, func(p *serverTestPeer) {
+		p.Limits.MaxConcurrent = 64
+		p.Limits.DialsPerSecond = 200
+	})
+	c := h.client()
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), clientTestDialBudget)
+			defer cancel()
+			conn, err := c.Dial(ctx, "svc")
+			if err != nil {
+				errs <- err
+				return
+			}
+			conn.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent Dial failed: %v", err)
 	}
 }
